@@ -1,305 +1,171 @@
-![SoundBase Plugin Template — the Lab's signal-flask mark, the SoundBase wordmark, and one real sweep from this plugin's synthetic spectrum](.github/banner.svg)
+# ModoRF — HAROGIC Spectrum Analyzers for SoundBase
 
-# SoundBase Plugin Template
+A SoundBase plugin that brings HAROGIC real-time spectrum analyzers into
+SoundBase as a live spectrum source, over SCPI on TCP.
 
-A complete, working SoundBase plugin. Press **Use this template**, run it, and
-you have a device in SoundBase's live-scan picker — it serves a synthetic
-spectrum (a noise floor, two carriers, an intermittent transient) so the whole
-path works before you own any hardware.
+Built by [ModoRF](https://modorf.com) for RF coordination at live events.
 
-Then you replace one file.
+## What it supports
 
-> **Your plugin has to live in a public repository on GitHub.** The Lab — the
-> route by which users install a plugin — lists a public GitHub repository
-> and installs from its GitHub Releases. A private repository
-> cannot be listed, and no other host (GitLab, Bitbucket, self-hosted) works.
-> Decide that before you start, not when you come to publish.
+Any HAROGIC analyzer whose SAStudio4 exposes SCPI — the SA, NX and PX series,
+including the handheld PXN. The plugin measures the tuning range of whatever
+unit it finds rather than looking it up by model, so one build serves a
+PXN-45, a PXN-90 and a rack NX without an edit.
+
+| | |
+|---|---|
+| Span | the unit's full range, measured at connect |
+| RBW / VBW | continuous, 0.1 Hz – 10 MHz, with automatic modes that track the span |
+| Reference level | −70 to +23 dBm |
+| Controls | reference level, RBW mode, VBW mode, dwell per sweep, FFT window, spur rejection, input attenuation, detector, preamplifier |
+| Point count | adopted from the instrument at connect, clamped to 16384 |
+| Trace modes | Clear/Write on the instrument — SoundBase accumulates max-hold and averaging itself, at the full sweep rate |
+
+### RBW that follows the span
+
+The control worth knowing about. Set **RBW when set to auto** to *Track point
+spacing* and the plugin sizes the filter to roughly one display point wide
+every time the span changes:
+
+| Span | Points | Point spacing | RBW chosen |
+|---|---|---|---|
+| 470–510 MHz | 4000 | 10 kHz | 10 kHz |
+| 470–900 MHz | 4000 | 108 kHz | 108 kHz |
+| 1.0–2.0 GHz | 4000 | 250 kHz | 250 kHz |
+| 900–2400 MHz | 4000 | 375 kHz | 375 kHz |
+
+which is the ratio you want across that whole range, because what you are
+looking for up at 2.4 GHz is wider than what you are looking for at 500 MHz.
+The analyzer's own `span/1000` and `span/100` presets are offered too.
+
+**Typing an RBW always wins.** The mode only decides what *auto* means; put
+the host's RBW field back to auto to hand control back to it.
+
+### What it does not do
+
+- **Only Standard Spectrum Analysis (`SWP`).** IQ streaming, real-time (RTA),
+  EMI pre-compliance, phase noise and the demodulation modes are not exposed.
+  The plugin puts the instrument into SWP at connect and leaves it there.
+- **No tracking generator**, no markers, no recording or playback. Those are
+  SAStudio4's own, and SoundBase has nowhere to put them.
+- **The SCPI data channel (port 5125) is not used.** Traces come over the
+  control channel, which is fast enough for coordination work and far simpler
+  to keep correct.
+- **No broadcast discovery.** An analyzer is found at an address you give it.
+
+### What it has been tested against
+
+So far, only the fake analyzer in `driver/fake-harogic.js`, which reproduces
+the HAROGIC clamping, quantizing and reply behaviour described in the SCPI
+guide. **It has not yet been run against real hardware.** Until that line
+changes, treat it as untested on an instrument.
+
+It is written against *SCPI Application Guide V4.55.64* and uses no command
+that guide does not document. Other models in the SA, NX and PX families
+should work — the plugin measures what it finds rather than assuming a model —
+but none has been tried. If you run one, say so in an issue.
+
+## Trusting this plugin
+
+Installing a plugin means trusting its author. SoundBase runs it as a separate
+process so a crash cannot take the app down, but that is fault isolation, not a
+security sandbox: this code runs with your privileges, like a VST or a
+Companion module. It is all in this repository — `adapter.js` and `driver/` are
+about 600 lines between them. Read them.
+
+It opens exactly one outbound TCP connection, to the address you type in, and
+sends nothing anywhere else.
+
+## Before it can connect
+
+SCPI is off by default. On the analyzer (or on the PC running SAStudio4):
+
+1. **System → SCPI**
+2. Tick **Enable**
+3. Note the **Control Port** — 5025 unless you changed it
+
+Then find the address of the machine running SAStudio4. On a handheld PXN that
+is the analyzer itself, and the quickest way is its own terminal:
+
+```sh
+hostname -I
+```
+
+Older SAStudio builds ran SCPI through a separate `HTRA_Server`. If one is
+still installed it holds port 5025 and the built-in service cannot start —
+uninstall it from `C:\HTRA_Server` first.
+
+## Setting it up in SoundBase
+
+Add the device by hand with its **IP address** and **Control port**, or put the
+addresses in the plugin's own settings and let them appear in the device
+picker:
+
+```
+192.168.1.100, 192.168.1.101:5026
+```
+
+There is no broadcast discovery for an instrument on an arbitrary subnet, so an
+address that is not listed and not typed in is an analyzer SoundBase will not
+find.
+
+## Development
 
 ```sh
 npm install
-npm run doctor      # is everything wired up?
+npm test     # the whole stack against a fake analyzer — no hardware needed
+npm run smoke
 npm start
-# SB_PLUGIN_READY {"port":54321}
-# [info] template 0.1.0 listening on 127.0.0.1:54321
 ```
 
-```sh
-npm test            # the contract, exercised against your adapter
-npm run smoke       # boots main.js as a child process, exactly as the host does
-```
+`driver/fake-harogic.js` is a fake instrument that reproduces the two HAROGIC
+habits the driver has to get right: a setting sends no reply, and values are
+clamped and quantized silently. It is why the test suite runs anywhere.
 
-To see it in SoundBase Desktop without copying anything, start the app with
-`SB_PLUGIN_DIRS` set to the folder that *contains* this one:
-
-```sh
-# macOS — this checkout is ~/CODE/my-plugin
-SB_PLUGIN_DIRS="$HOME/CODE" open -a "SoundBase Desktop"
-```
-
-[docs/running-in-soundbase.md](docs/running-in-soundbase.md) has the rest:
-the plugin manager, where your device shows up, and the logs.
-
-**Never used SoundBase?** Start with
-[docs/soundbase.md](docs/soundbase.md) — what the app is, what the people using
-it are doing, and where your device lands. It is written for someone who will
-never see the SoundBase code.
-
-## What a plugin is
-
-A **network service** that provides devices to SoundBase over a versioned HTTP
-contract. SoundBase spawns it as a child process and supervises it —
-handshake, health, crash-restart, teardown. You write device logic. You never
-write UI, IPC, or HTTP.
+### The files
 
 ```
-soundbase-plugin.json   your identity, products and config fields
-main.js                 shell bootstrap — copy it verbatim, don't edit it
-adapter.js              your device logic. This is the file you replace.
-driver/                 optional: anything protocol-specific adapter.js uses
+soundbase-plugin.json      the manifest — products, and the fields the user fills in
+main.js                    unchanged from the template; do not edit
+adapter.js                 the SoundBase contract: discovery, open, config, sweep
+driver/harogic-scpi.js     the wire. Knows nothing about SoundBase.
+driver/fake-harogic.js     an analyzer to test against
+__tests__/harogic.test.js  shell, adapter, driver and socket, end to end
 ```
 
-`@soundbase/plugin-shell` implements the entire contract: the HTTP server on
-`127.0.0.1:0`, the `SB_PLUGIN_READY` stdout handshake, bearer-token auth, SSE
-lifecycle events, sweep-id bookkeeping, `GET /trace` long-polling, and
-trace-mode accumulation at full sweep rate. Your adapter never sees a request.
+### Notes for whoever picks this up next
 
-## Installing the SDK
+- **`*IDN?` has no model name in it.** HAROGIC answers with a literal
+  `Hardware` where other instruments put `PXN-45`. The tuning range is measured
+  at `open()` instead — push the stop frequency past anything that exists, read
+  back what it clamped to, and put the user's own span back.
+- **Settings are silent; only queries answer.** Anything that writes and then
+  waits for an acknowledgement will hang, and worse, will match every later
+  reply to the wrong command.
+- **Trace arrives as one long line**, semicolon separated in practice though
+  the guide's prose says commas. The driver accepts either.
+- **`TRAC:FORM 0` matters.** SoundBase builds the frequency axis from start,
+  stop and point count, which is only true for equally spaced points. In
+  PrecisFrq the plot looks right and is shifted.
+- **The point count is whatever the trace is long**, not whatever `SWE:POIN`
+  was asked for. `applyConfig` reads one real trace and reports its length.
+- **Never pass a large point count straight through.** A PXN-45 asked for a
+  million points stops answering SCPI altogether and has to be power-cycled;
+  its own default is 4000. The adapter clamps at 16384, which is far more than
+  any sweep needs and far less than what wedges the instrument.
+- **Do not expose the instrument's own Max Hold or averaging.** SoundBase
+  accumulates trace modes itself at the full sweep rate, so a device left
+  holding would hold twice and never release. `open()` forces Clear/Write.
 
-```sh
-npm install
-```
+Reference: *HAROGIC Spectrum Analyzer SCPI Application Guide V4.55.64*.
 
-That is the whole setup. The two SDK packages are on public npm — nothing else
-to fetch, and no SoundBase checkout required.
+---
 
-## Making it yours
+## Inicio rápido (ES)
 
-**1. Take an id.**
+1. En el analizador: **System → SCPI → Enable**. El puerto de control es 5025.
+2. Averigua su IP. En un PXN de mano, abre su terminal y escribe `hostname -I`.
+3. En SoundBase, añade el dispositivo con esa IP y el puerto 5025.
 
-```sh
-npm run rename my-plugin-id -- --name "My Analyzer"
-```
-
-The id appears in five places that must agree — the manifest, every product's
-`deviceTypeId`, `adapter.js`, the package name, and the `x.<id>.` namespace of
-every extension state key. `rename` changes all five.
-Do it before you publish anything: the id is stored in users' saved projects.
-
-**2. Describe your hardware** in `soundbase-plugin.json` — one `products` entry
-per model, plus the config fields SoundBase should render.
-([reference](docs/manifest-reference.md))
-
-**3. Replace `adapter.js`.** It exports `discoverDevices` and one adapter
-factory per module — `createSpectrumAnalyzerAdapter` for a spectrum source,
-`createMonitoringAdapter` for a receiver or IEM transmitter that lands in
-device monitoring. The template ships one synthetic device of each; keep the
-factory your hardware needs:
-
-```js
-// called while SoundBase is enumerating; return currently reachable devices
-export async function discoverDevices(pluginConfig) {
-  return [{ id: 'usb:/dev/tty…', name: 'My Analyzer',
-            product: 'plugin:my-id/model',
-            transport: { kind: 'usb', path: '/dev/tty…' } }];
-}
-
-// one instance per device; device = { id, product, config }
-export function createSpectrumAnalyzerAdapter(device, pluginConfig) {
-  return {
-    async open() {              // connect + identify
-      return {
-        capabilities: { minFrequencyHz, maxFrequencyHz, rbwHz: [...] },
-        identity: { model, firmware },
-      };
-    },
-    async applyConfig(cfg) {    // cfg = { startHz, stopHz, pointCount?, rbwHz?, controls? }
-      return effective;         // echo what the hardware actually accepted
-    },
-    // onTrace(ampsDbm: number[]) per sweep; an optional second argument,
-    // [{ name, amplitudesDbm }], adds named curves on the same axis
-    async startSweep(onTrace) {},
-    async stopSweep() {},
-    async close() {},
-  };
-}
-```
-
-```js
-// a monitored device: push state, apply commands, let the state answer
-export function createMonitoringAdapter(device, pluginConfig) {
-  return {
-    async open() {              // connect, then report everything through this.onState
-      this.onState('frequency', { channels: { 1: 518.1 } });
-      return { channelCount: 1, properties: [ /* PropertyControl descriptors */ ] };
-    },
-    async setProperty({ propertyId, channelIndex, value }) { /* apply, then onState */ },
-    async close() {},
-  };
-}
-```
-
-Full reference: [docs/adapter-reference.md](docs/adapter-reference.md).
-
-**4. Keep the tests passing.** `__tests__/` drives your adapter through the
-real shell over real HTTP. They are written against the *contract*, not against
-the synthetic source, so they keep meaning once your adapter talks to hardware.
-
-## A worked example with a real transport
-
-[`examples/network-analyzer/`](examples/network-analyzer/README.md) is a second
-complete plugin — a networked instrument over TCP — showing everything the
-synthetic one skips: discovery by probing, addressing from device config, a
-driver with its own fake, device controls, clamping, and a socket that dies
-mid-sweep. Its tests run with nothing plugged in.
-
-## Rules that will bite you if you break them
-
-- **Device ids are yours and must be stable across restarts.** `usb:<path>`,
-  `net:<host>` are the conventions the first-party plugins use. They appear in
-  URLs, and a project stores them.
-- **Device addressing arrives explicitly** on `POST /devices`. Never read a
-  device address from your own machine-local state — the same project opened on
-  another machine must work.
-- **Clamp, don't reject.** When a requested RBW or reference level is out of
-  range, snap it and echo what you settled on. The form keeps showing the
-  user's saved value either way; a rejection just looks broken.
-- **Echo the effective config.** `applyConfig`'s return value is what
-  `GET /devices/{id}/configuration` reports, so the host can always read back
-  what is actually in force.
-- **`main.js` stays byte-identical.** If you find yourself editing it, the
-  thing you want almost certainly belongs in `adapter.js`.
-
-`npm run doctor` checks the ones a machine can check.
-
-## Device controls — knobs SoundBase has never heard of
-
-Return `controls` from `open()` and SoundBase renders them beside RBW and point
-count, then hands the values back in `applyConfig`'s `cfg.controls`, keyed by
-the same ids:
-
-```js
-controls: [
-  { id: 'refLevelDbm', type: 'number', label: 'Reference level',
-    unit: 'dBm', default: -20, min: -56, max: 20 },
-  { id: 'detector', type: 'dropdown', label: 'Detector', default: 'peak',
-    choices: [{ id: 'peak', label: 'Peak' }, { id: 'average', label: 'Average' }] },
-]
-```
-
-Nothing between the form and your adapter interprets them — SoundBase never
-learns what a detector is. That means **adding a knob to a shipped plugin needs
-no SoundBase release.** Build them in `open()` so ranges can come from the
-hardware you just identified.
-
-## Native code, and the gotcha that will cost you a week
-
-If your device needs a native library or a language runtime, read
-[docs/native-runtimes.md](docs/native-runtimes.md) before you design anything.
-The short version, learned the hard way on a USRP:
-
-**Put wedge-prone native work in a child process you can kill.** A blocking C
-library that owns a USB device can hang mid-call when someone trips over the
-cable. If that call is in your plugin's process, your plugin is gone and
-SoundBase restarts it. If it is in a child, you `SIGKILL` it, report a clean
-device error, and stay healthy. The process boundary between SoundBase and you
-protects *SoundBase*; you need your own boundary to protect *yourself*.
-
-## Documentation
-
-| | |
-|---|---|
-| [soundbase.md](docs/soundbase.md) | The app, the domain, and where your device lands. **Start here.** |
-| [architecture.md](docs/architecture.md) | Process model, lifecycle, supervision, versioning |
-| [getting-started.md](docs/getting-started.md) | Clone to first change, end to end |
-| [adapter-reference.md](docs/adapter-reference.md) | Every adapter method in detail |
-| [manifest-reference.md](docs/manifest-reference.md) | Every manifest field |
-| [http-contract.md](docs/http-contract.md) | The wire, for debugging with `curl` |
-| [testing.md](docs/testing.md) | The three checks, and faking hardware |
-| [running-in-soundbase.md](docs/running-in-soundbase.md) | Running a working tree with `SB_PLUGIN_DIRS`, the plugin manager, logs |
-| [native-runtimes.md](docs/native-runtimes.md) | Native libraries and bundled runtimes |
-| [publishing.md](docs/publishing.md) | Releases, the Lab, licensing |
-| [troubleshooting.md](docs/troubleshooting.md) | Symptom → cause |
-| [glossary.md](docs/glossary.md) | RF and SoundBase vocabulary |
-
-## Scripts
-
-| | |
-|---|---|
-| `npm start` | run the plugin |
-| `npm test` | contract tests through the real shell |
-| `npm run doctor` | is this plugin well-formed? with fixes for anything that isn't |
-| `npm run smoke` | boot as a child process, handshake, sweep — what the host does |
-| `npm run manifest` | validate `soundbase-plugin.json` against the contract schema |
-| `npm run rename <id>` | take an id, in all five places it appears |
-| `npm run pack:release` | build the zip users install, and boot-check it |
-| `npm run bump <x.y.z>` | move the version in every file that carries it; tag and push to release |
-
-## The specification
-
-The normative documents install with your dependencies:
-
-```
-node_modules/@soundbase/plugin-contract/spec/
-  soundbase-plugin.schema.json     validate your manifest against this
-  core.openapi.yaml                the core plugin API
-  spectrum-analyzer.openapi.yaml   the SpectrumAnalyzer module
-  channel-monitoring.openapi.yaml  the ChannelMonitoring module
-  property-control.openapi.yaml    the PropertyControl module
-```
-
-They are not a copy that might have gone stale — they ship inside the contract
-package, so they always describe the shell version your lockfile pins.
-
-Unknown modules and unknown properties are tolerated everywhere, deliberately:
-shipping a plugin must never require a SoundBase release.
-
-## Versioning
-
-Two version numbers that mean different things:
-
-- **`version`** in `soundbase-plugin.json` and `package.json` is *yours*. Semver
-  your plugin however you like.
-- **`template`** records what you started from and should be left alone:
-
-  ```json
-  "template": { "name": "soundbase-plugin-template", "version": "1.0.0" }
-  ```
-
-  It is correct forever *because* it goes stale. When a template release notes
-  a fix to the example error handling, this is what tells you whether it
-  applies to you. Do not bump it to match a template you have not merged.
-
-**`contract` is the only thing that governs compatibility.** Two plugins built
-from different template versions can speak exactly the same contract, and an
-old lineage does not make an incompatible plugin compatible.
-
-**One repository, one plugin.** A release is one zip carrying one
-`soundbase-plugin.json`, and a repository backs exactly one listing on the
-SoundBase Lab — a new version is a new release on that listing, and a second
-plugin needs its own repository.
-
-## Working with Claude
-
-[`CLAUDE.md`](CLAUDE.md) gives Claude Code and other coding agents the contract
-invariants, the file map, and worked prompts for the common tasks —
-implementing discovery, adding a control, wrapping a native driver. It is worth
-reading yourself.
-
-## Licence
-
-This template and `@soundbase/plugin-shell` are licensed under the **Business
-Source License 1.1** — source available, not open source. See `LICENSE` for the
-exact terms, and read the **Additional Use Grant**: it permits developing,
-distributing and operating plugins for SoundBase, including commercially, and
-does not permit using this code with anything that is not SoundBase.
-
-Each version converts automatically to the Change License named in `LICENSE` on
-its Change Date.
-
-Your own plugin code is yours; licence it however you like. The Additional Use
-Grant governs the parts you received under this licence.
-
-## Support
-
-Issues on this repository are for the template itself. For the plugin contract,
-device behaviour, or getting a plugin listed, see the SoundBase Lab.
+Para trabajar en el código sin tener el analizador delante, `npm test` levanta
+un analizador falso y prueba todo el camino.

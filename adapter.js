@@ -1,388 +1,603 @@
-// Synthetic adapters — one per module — for the two products the manifest
-// declares. Replace this file (and, for anything with a wire protocol, a
-// driver/ beside it) to build a real plugin: main.js, the manifest shape and
-// the shell stay exactly as they are. A plugin that only does one of the two
-// things below simply does not export the other factory.
+// ModoRF — HAROGIC spectrum analyzers for SoundBase.
+//
+// Talks SCPI over TCP to the SCPI service built into SAStudio4. On a handheld
+// PXN the software runs on the instrument itself, so the address is the
+// analyzer's own IP; on a rack SA/NX driven from a PC it is that PC's address.
+// Either way it is the host running SAStudio4, and SCPI has to be switched on
+// there under System > SCPI.
+//
+// The wire protocol lives in driver/harogic-scpi.js. This file is only about
+// the SoundBase contract.
 
-import { HttpError } from '@soundbase/plugin-shell';
+import { HarogicClient, probe } from './driver/harogic-scpi.js';
 
-// The products these adapters announce their devices as. Each MUST be one of
-// the `deviceTypeId`s declared in soundbase-plugin.json — the shell warns and
-// the host ignores a device naming a product the manifest never declared.
-// `npm run rename` keeps them in step; a test asserts they agree.
-export const PRODUCT = 'plugin:template/synthetic';
-export const IEM_PRODUCT = 'plugin:template/synthetic-iem';
+export const PRODUCT = 'plugin:modorf-harogic/px-series';
 
-// ---------------------------------------------------------------------------
-// SpectrumAnalyzer: a synthetic spectrum
-// ---------------------------------------------------------------------------
+const DEFAULT_PORT = 5025;
+const DEFAULT_SWEEP_INTERVAL_MS = 50;
 
-const MIN_FREQUENCY_HZ = 100_000;
-const MAX_FREQUENCY_HZ = 6_000_000_000;
-const RBW_HZ = [1_000, 3_000, 10_000, 30_000, 100_000, 300_000, 1_000_000];
+// Used only when measuring the unit's real range fails. The narrowest HAROGIC
+// span, so a fallback never invites the user past what the hardware can do.
+const FALLBACK_MIN_HZ = 9_000;
+const FALLBACK_MAX_HZ = 4_500_000_000;
+
+// Where the probe pushes to find the ends of the range.
+const PROBE_LOW_HZ = 0;
+const PROBE_HIGH_HZ = 1e13;
+
 const DEFAULT_START_HZ = 470_000_000;
 const DEFAULT_STOP_HZ = 616_000_000;
-const DEFAULT_POINT_DIVISOR = 450;
-const MAX_POINTS = 2000;
-const SWEEP_INTERVAL_MS = 50;
+const FALLBACK_POINTS = 4_000;
 
-const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
-const round1 = (v) => Math.round(v * 10) / 10;
+// A PXN-45 asked for a million points stops answering SCPI at all and has to
+// be power-cycled; its own default is 4000. This ceiling is far above anything
+// a sweep needs (at 16k points a 2 GHz span is 120 kHz per point) and far
+// below what wedges the instrument. Clamping here means neither a typo in the
+// host's field nor a badly behaved caller can take the analyzer down mid-show.
+const MAX_POINTS = 16_384;
+const MIN_POINTS = 2;
+
+// The instrument's own limits, from the PXN product manual.
+const MIN_BW_HZ = 0.1;
+const MAX_BW_HZ = 10_000_000;
+const MIN_REF_LEVEL_DBM = -70;
+const MAX_REF_LEVEL_DBM = 23;
+
+// RBW on these instruments is continuous from 0.1 Hz to 10 MHz, so this list
+// is not a hardware limit — it is the 1-2-5 ladder a live-event coordinator
+// actually reaches for, offered as a menu because picking 100 kHz from a list
+// beats typing 100000 between songs. Anything on it is sent through verbatim;
+// leaving the host's field on auto hands the choice to the rbwMode control,
+// which can and does resolve to values between these rungs.
+const RBW_CHOICES_HZ = [50_000, 100_000, 200_000, 500_000, 1_000_000];
+
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
-// a gaussian "signal" bump, height in dB above the noise floor
-const bump = (f, center, width, height) =>
-  height * Math.exp(-(((f - center) / width) ** 2));
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+/** three significant figures — the hardware is continuous, people are not */
+const tidy = (v) => Number(v.toPrecision(3));
 
-const nearestRbw = (hz) =>
-  RBW_HZ.reduce((best, candidate) =>
-    Math.abs(candidate - hz) < Math.abs(best - hz) ? candidate : best
-  );
-
-class SyntheticAnalyzerAdapter {
-  constructor(device, pluginConfig = {}) {
-    this.device = device;
-    this.sweepIntervalMs = isNum(pluginConfig.sweepIntervalMs)
-      ? pluginConfig.sweepIntervalMs
-      : SWEEP_INTERVAL_MS;
-    this.config = {
-      startHz: DEFAULT_START_HZ,
-      stopHz: DEFAULT_STOP_HZ,
-      pointCount: DEFAULT_POINT_DIVISOR + 1,
-      rbwHz: undefined,
-    };
-    this.sweepCount = 0;
-    this.timer = null;
-    this.onFatal = null;
-  }
-
-  async open() {
-    return {
-      capabilities: {
-        minFrequencyHz: MIN_FREQUENCY_HZ,
-        maxFrequencyHz: MAX_FREQUENCY_HZ,
-        rbwHz: [...RBW_HZ],
-      },
-      identity: { model: 'Synthetic', firmware: '0.1.0' },
-    };
-  }
-
-  async applyConfig(cfg = {}) {
-    const startHz = clamp(
-      isNum(cfg.startHz) ? cfg.startHz : this.config.startHz,
-      MIN_FREQUENCY_HZ,
-      MAX_FREQUENCY_HZ
-    );
-    const stopHz = clamp(
-      isNum(cfg.stopHz) ? cfg.stopHz : this.config.stopHz,
-      startHz + 1,
-      MAX_FREQUENCY_HZ
-    );
-    const span = Math.max(1, stopHz - startHz);
-    let pointCount;
-    if (isNum(cfg.pointCount)) {
-      pointCount = Math.round(cfg.pointCount);
-    } else {
-      const step =
-        isNum(cfg.stepHz) && cfg.stepHz > 0
-          ? cfg.stepHz
-          : span / DEFAULT_POINT_DIVISOR;
-      pointCount = Math.round(span / step) + 1;
-    }
-    this.config = {
-      startHz,
-      stopHz,
-      pointCount: clamp(pointCount, 2, MAX_POINTS),
-      rbwHz: isNum(cfg.rbwHz) ? nearestRbw(cfg.rbwHz) : undefined,
-    };
-    return { ...this.config };
-  }
-
-  async startSweep(onTrace) {
-    if (this.timer) return;
-    this.timer = setInterval(
-      () => onTrace(this.buildTrace()),
-      this.sweepIntervalMs
-    );
-    this.timer.unref?.();
-  }
-
-  async stopSweep() {
-    if (!this.timer) return;
-    clearInterval(this.timer);
-    this.timer = null;
-  }
-
-  async close() {
-    await this.stopSweep();
-  }
-
-  buildTrace() {
-    const { startHz, stopHz, pointCount } = this.config;
-    const span = Math.max(1, stopHz - startHz);
-    const amps = new Array(pointCount);
-    const peakA = startHz + span * 0.33;
-    const peakB = startHz + span * 0.66;
-    const transient = startHz + span * 0.5;
-    this.sweepCount += 1;
-    // a transient on roughly one sweep in seven — this is why max-hold has to
-    // accumulate every sweep, not just the ones a client happens to poll
-    const withTransient = this.sweepCount % 7 === 0;
-    for (let i = 0; i < pointCount; i += 1) {
-      const f = startHz + (i * (stopHz - startHz)) / (pointCount - 1);
-      let amp = -100 + (Math.random() * 4 - 2);
-      amp += bump(f, peakA, span * 0.01, 45);
-      amp += bump(f, peakB, span * 0.006, 30);
-      if (withTransient) amp += bump(f, transient, span * 0.003, 50);
-      amps[i] = round1(amp);
-    }
-    return amps;
-  }
-}
-
-export function createSpectrumAnalyzerAdapter(device, pluginConfig) {
-  return new SyntheticAnalyzerAdapter(device, pluginConfig);
-}
-
-// ---------------------------------------------------------------------------
-// ChannelMonitoring + PropertyControl: a synthetic stereo IEM transmitter
-// ---------------------------------------------------------------------------
-//
-// Two stereo channels, each with a bodypack receiver paired to it. Audio
-// meters move on a slow sine so the bars visibly breathe; the packs drain
-// their batteries and wobble their RF. Every property the layout shows is
-// writable through `setProperty`, and the new value comes back as state —
-// which is the whole PropertyControl idea: the device is the truth.
-
-const IEM_CHANNEL_COUNT = 2;
-const IEM_MIN_MHZ = 470;
-const IEM_MAX_MHZ = 608;
-const IEM_STEP_MHZ = 0.025;
-const IEM_NAME_MAX = 8; // mirrors the manifest's channelName.maxLength
-const TX_POWER_MW = [10, 50, 100];
-// The shell coalesces `meters` to one patch per 50 ms tick, so reporting any
-// faster than that is wasted work; a real device reports at whatever rate it
-// has and lets the shell do the coalescing.
-const METER_INTERVAL_MS = 50;
-const PACK_INTERVAL_MS = 1_000;
-
-const quantize = (v, step) => Math.round(v / step) * step;
-const round3 = (v) => Math.round(v * 1000) / 1000;
-const nearestTxPower = (mw) =>
-  TX_POWER_MW.reduce((best, candidate) =>
-    Math.abs(candidate - mw) < Math.abs(best - mw) ? candidate : best
-  );
-
-class SyntheticIemAdapter {
-  constructor(device) {
-    this.device = device;
-    this.channels = {
-      1: {
-        channelName: 'VOX L',
-        frequency: 518.1,
-        txPower: 50,
-        mute: false,
-        rfState: true,
-      },
-      2: {
-        channelName: 'VOX R',
-        frequency: 542.35,
-        txPower: 50,
-        mute: false,
-        rfState: true,
-      },
-    };
-    this.packs = {
-      'pack:1': {
-        id: 'pack:1',
-        name: 'Pack 1',
-        channel: 1,
-        battery: { percent: 92, lifetimeInMinutes: 410 },
-        meters: { rf1: -55, lqi: 96 },
-      },
-      'pack:2': {
-        id: 'pack:2',
-        name: 'Pack 2',
-        channel: 2,
-        battery: { percent: 61, lifetimeInMinutes: 230 },
-        meters: { rf1: -63, lqi: 88 },
-      },
-    };
-    this.phase = 0;
-    this.meterTimer = null;
-    this.packTimer = null;
-    // assigned by the shell before open()
-    this.onState = null;
-    this.onWarnings = null;
-    this.onFatal = null;
-  }
-
-  async open() {
-    // the complete state first, so SoundBase renders a full card at once
-    for (const key of [
-      'channelName',
-      'frequency',
-      'txPower',
-      'mute',
-      'rfState',
-    ])
-      this.emitChannelKey(key);
-    this.onState?.('receivers', {
-      added: Object.values(this.packs).map((pack) => ({ ...pack })),
-      updated: [],
-      removed: [],
-    });
-    // an extension key: which pack each channel feeds, something SoundBase
-    // has no core key for. Declared in the manifest's stateKeys.
-    this.onState?.('x.template.packLink', {
-      channels: { 1: 'pack:1', 2: 'pack:2' },
-    });
-    this.meterTimer = setInterval(() => this.tickMeters(), METER_INTERVAL_MS);
-    this.meterTimer.unref?.();
-    this.packTimer = setInterval(() => this.tickPacks(), PACK_INTERVAL_MS);
-    this.packTimer.unref?.();
-    return {
-      channelCount: IEM_CHANNEL_COUNT,
-      properties: this.properties(),
-      identity: { model: 'Synthetic IEM', firmware: '0.1.0' },
-    };
-  }
-
-  async close() {
-    clearInterval(this.meterTimer);
-    clearInterval(this.packTimer);
-    this.meterTimer = null;
-    this.packTimer = null;
-  }
-
-  /** PropertyControl descriptors, in SoundBase's PropertyDescriptor shape. */
-  properties() {
-    const channel = (id, value) => ({
-      id,
-      scope: 'channel',
-      access: 'readWrite',
-      stateBinding: { key: id },
-      value,
-    });
-    return [
-      channel('txPower', { type: 'enum', options: TX_POWER_MW, unit: 'mW' }),
-      channel('mute', { type: 'boolean' }),
-      channel('frequency', {
-        type: 'number',
-        min: IEM_MIN_MHZ,
-        max: IEM_MAX_MHZ,
-        step: IEM_STEP_MHZ,
-        unit: 'MHz',
-      }),
-      channel('channelName', { type: 'string', maxLength: IEM_NAME_MAX }),
-    ];
-  }
-
-  /** `{ requestId, propertyId, channelIndex?, entityId?, value }` → applied, then reported. */
-  async setProperty({ propertyId, channelIndex, value }) {
-    const ch = this.channels[channelIndex];
-    if (!ch) {
-      throw new HttpError(
-        400,
-        'unknown_channel',
-        `${propertyId} is per channel; channelIndex must be 1..${IEM_CHANNEL_COUNT}`
-      );
-    }
-    switch (propertyId) {
-      case 'txPower':
-        if (!isNum(value)) throw badValue(propertyId, 'a number in mW');
-        ch.txPower = nearestTxPower(value);
-        break;
-      case 'mute':
-        ch.mute = Boolean(value);
-        break;
-      case 'frequency':
-        if (!isNum(value)) throw badValue(propertyId, 'a number in MHz');
-        // clamp and quantize, then echo: the card shows what the device did
-        ch.frequency = round3(
-          quantize(clamp(value, IEM_MIN_MHZ, IEM_MAX_MHZ), IEM_STEP_MHZ)
-        );
-        break;
-      case 'channelName':
-        if (typeof value !== 'string') throw badValue(propertyId, 'a string');
-        ch.channelName = value.trim().toUpperCase().slice(0, IEM_NAME_MAX);
-        break;
-      default:
-        throw new HttpError(
-          400,
-          'unknown_property',
-          `No property ${propertyId} on ${IEM_PRODUCT}`
-        );
-    }
-    this.emitChannelKey(propertyId, channelIndex);
-  }
-
-  emitChannelKey(key, only) {
-    const channels = {};
-    for (const [n, ch] of Object.entries(this.channels)) {
-      if (only === undefined || Number(n) === only) channels[n] = ch[key];
-    }
-    this.onState?.(key, { channels });
-  }
-
-  tickMeters() {
-    this.phase += 0.12;
-    const channels = {};
-    for (const [n, ch] of Object.entries(this.channels)) {
-      const swing = 14 * Math.sin(this.phase + Number(n));
-      const af = ch.mute ? -90 : round1(-24 + swing);
-      channels[n] = { af, afR: round1(af - 2.5), txOn: ch.rfState };
-    }
-    this.onState?.('meters', { timestamp: Date.now(), channels });
-  }
-
-  tickPacks() {
-    const updated = [];
-    for (const pack of Object.values(this.packs)) {
-      pack.battery.percent = Math.max(0, pack.battery.percent - 1);
-      pack.battery.lifetimeInMinutes = Math.max(
-        0,
-        pack.battery.lifetimeInMinutes - 4
-      );
-      pack.meters.rf1 = round1(pack.meters.rf1 + (Math.random() * 4 - 2));
-      pack.meters.lqi = clamp(
-        Math.round(pack.meters.lqi + (Math.random() * 6 - 3)),
-        0,
-        100
-      );
-      updated.push({
-        id: pack.id,
-        changes: { battery: { ...pack.battery }, meters: { ...pack.meters } },
-      });
-    }
-    this.onState?.('receivers', { added: [], updated, removed: [] });
-  }
-}
-
-const badValue = (propertyId, expected) =>
-  new HttpError(400, 'bad_value', `${propertyId} expects ${expected}`);
-
-export function createMonitoringAdapter(device, pluginConfig) {
-  return new SyntheticIemAdapter(device, pluginConfig);
-}
+const delay = (ms) =>
+  new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
 
 // ---------------------------------------------------------------------------
 // discovery
 // ---------------------------------------------------------------------------
 
-// one fixed device per product, so the discovery path is exercised end to end
-export async function discoverDevices() {
-  return [
-    {
-      id: 'synthetic:1',
-      name: 'Synthetic Analyzer',
-      product: PRODUCT,
-      transport: { kind: 'synthetic' },
-    },
-    {
-      id: 'synthetic-iem:1',
-      name: 'Synthetic IEM',
-      product: IEM_PRODUCT,
-      transport: { kind: 'synthetic' },
-    },
-  ];
+/**
+ * Analyzers reachable right now.
+ *
+ * There is no broadcast discovery for an instrument on an arbitrary subnet, so
+ * the addresses come from the plugin's own configuration — the user types them
+ * once. The shell calls this once a second while SoundBase is enumerating and
+ * never otherwise, so it stays cheap and stays silent.
+ */
+export async function discoverDevices(pluginConfig = {}) {
+  const addresses = parseAddresses(pluginConfig.addresses);
+  const found = await Promise.all(
+    addresses.map(async ({ host, port }) => {
+      const identity = await probe({ host, port });
+      if (!identity) return null;
+      return {
+        // Derived from the address and nothing else, so it is stable across
+        // restarts. It goes into URLs and into the user's saved project.
+        id: `net:${host}:${port}`,
+        name: `HAROGIC (${host})`,
+        product: PRODUCT,
+        transport: { kind: 'network', host, port },
+      };
+    })
+  );
+  return found.filter(Boolean);
+}
+
+/** "192.168.1.100, 192.168.1.101:5026" -> [{host, port}, …] */
+function parseAddresses(raw) {
+  if (typeof raw !== 'string') return [];
+  return raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const [host, port] = entry.split(':');
+      return { host, port: Number(port) || DEFAULT_PORT };
+    });
+}
+
+// ---------------------------------------------------------------------------
+// the analyzer
+// ---------------------------------------------------------------------------
+
+export function createSpectrumAnalyzerAdapter(device, pluginConfig) {
+  return new HarogicAnalyzerAdapter(device, pluginConfig);
+}
+
+class HarogicAnalyzerAdapter {
+  constructor(device, pluginConfig = {}) {
+    // Addressing arrives in the device the host asked for, never from a file
+    // beside the plugin: the same project opened on another machine has to
+    // work, and that machine has never seen this one's configuration.
+    const { host, port } = addressOf(device);
+    this.host = host;
+    this.port = port;
+    this.sweepIntervalMs = isNum(pluginConfig.sweepIntervalMs)
+      ? Math.max(0, pluginConfig.sweepIntervalMs)
+      : DEFAULT_SWEEP_INTERVAL_MS;
+    this.client = null;
+    this.range = { minHz: FALLBACK_MIN_HZ, maxHz: FALLBACK_MAX_HZ };
+    this.defaultPoints = FALLBACK_POINTS;
+    this.effective = null;
+    this.sweeping = false;
+    /** assigned by the shell; call it when the transport dies unprompted */
+    this.onFatal = null;
+  }
+
+  /**
+   * Connect, put the instrument into a state this adapter can reason about,
+   * and report what *this* unit can do.
+   */
+  async open() {
+    this.client = new HarogicClient({ host: this.host, port: this.port });
+    this.client.onFatal = (err) => this.onFatal?.(err);
+    await this.client.connect();
+
+    const identity = await this.client.identify();
+
+    // Standard Spectrum Analysis. Everything below is a SWP-mode command.
+    await this.client.write('INST:MODE SWP');
+
+    // Four settings the rest of this adapter depends on:
+    //
+    //   TRAC:FORM 0       equally spaced frequency points. SoundBase builds
+    //                     the frequency axis from start/stop/pointCount, which
+    //                     is only true in this format — PrecisFrq would draw a
+    //                     trace that looks right and is shifted.
+    //   TRAC:DATA:TYPE    ASCII, so the trace arrives as text we can parse.
+    //   TRAC:TYPE WRIT    Clear/Write. The shell accumulates max-hold and
+    //                     averaging itself, at the full sweep rate, which is
+    //                     the only place it can be done without losing a
+    //                     transient. An instrument left in Max Hold would hold
+    //                     twice and never release.
+    //   INIT:MODE CONT    keep sweeping, so a trace read always has fresh data.
+    await this.client.write('TRAC:FORM 0');
+    await this.client.write('TRAC:DATA:TYPE ASC8');
+    await this.client.write('TRAC:TYPE WRIT');
+    await this.client.write('INIT:MODE CONT');
+
+    // Adopt the instrument's own point count as the default rather than
+    // imposing one: a PXN-45 boots at 4000, and that is a number its firmware
+    // is known to be happy with.
+    const points = await this.client.number('SWE:POIN');
+    if (isNum(points) && points >= MIN_POINTS) {
+      this.defaultPoints = Math.min(Math.round(points), MAX_POINTS);
+    }
+
+    this.range = await this.#measureRange();
+
+    return {
+      capabilities: {
+        minFrequencyHz: this.range.minHz,
+        maxFrequencyHz: this.range.maxHz,
+        minRefLevelDbm: MIN_REF_LEVEL_DBM,
+        maxRefLevelDbm: MAX_REF_LEVEL_DBM,
+        rbwHz: [...RBW_CHOICES_HZ],
+        controls: this.#controls(),
+      },
+      identity: {
+        model: identity.model,
+        firmware: identity.firmware,
+        manufacturer: identity.manufacturer,
+        serial: identity.serial,
+      },
+    };
+  }
+
+  /**
+   * Knobs SoundBase has never heard of, rendered beside RBW and point count
+   * and handed back in `cfg.controls`. Built here rather than declared in the
+   * manifest so their ranges can come from the unit just identified.
+   */
+  #controls() {
+    return [
+      {
+        id: 'refLevelDbm',
+        type: 'number',
+        label: 'Reference level',
+        unit: 'dBm',
+        default: 0,
+        min: MIN_REF_LEVEL_DBM,
+        max: MAX_REF_LEVEL_DBM,
+        step: 1,
+        help: 'The single biggest lever on what you can see. On a PXN-45 the noise floor is about 24 dB lower at -70 dBm than at -20 dBm. Lower it to find weak carriers; raise it when a strong transmitter is compressing the front end.',
+      },
+      {
+        id: 'rbwMode',
+        type: 'dropdown',
+        label: 'RBW when set to auto',
+        default: 'tracking',
+        choices: [
+          { id: 'tracking', label: 'Track point spacing' },
+          { id: 'span1000', label: 'Span / 1000' },
+          { id: 'span100', label: 'Span / 100' },
+          { id: 'analyzer', label: "Analyzer's own auto" },
+        ],
+        help: 'What auto means. **Track point spacing** sets RBW to roughly one display point wide, so changing span re-tunes the filter for you — right across a 40 MHz UHF scan and a 1.5 GHz survey alike. Typing an RBW by hand always overrides this.',
+      },
+      {
+        id: 'vbwMode',
+        type: 'dropdown',
+        label: 'VBW when set to auto',
+        default: 'tentimes',
+        choices: [
+          { id: 'tentimes', label: '10 x RBW (no smoothing)' },
+          { id: 'equal', label: '= RBW' },
+          { id: 'tenth', label: 'RBW / 10 (smoothed)' },
+          { id: 'hundredth', label: 'RBW / 100 (very smooth)' },
+        ],
+        help: 'Video bandwidth averages the trace. Narrower than RBW steadies the noise floor and makes a weak carrier stand out; it also hides short bursts, so widen it again when hunting intermittent signals.',
+      },
+      {
+        id: 'sweepDwell',
+        type: 'dropdown',
+        label: 'Dwell per sweep',
+        default: 'SWT',
+        choices: [
+          { id: 'SWT', label: 'Fastest' },
+          { id: 'SWT2', label: '2 x' },
+          { id: 'SWT4', label: '4 x' },
+          { id: 'SWT10', label: '10 x' },
+          { id: 'SWT20', label: '20 x' },
+          { id: 'SWT50', label: '50 x' },
+        ],
+        help: 'How long the analyzer listens at each point, as a multiple of the fastest it could sweep. Raise it to catch an intermittent transmitter that a fast sweep flies straight past; the sweep slows by the same factor.',
+      },
+      {
+        id: 'fftWindow',
+        type: 'dropdown',
+        label: 'FFT window',
+        default: 'NUTT',
+        choices: [
+          { id: 'NUTT', label: 'Blackman-Nuttall (default)' },
+          { id: 'LOWS', label: 'Low side lobe' },
+          { id: 'FLAT', label: 'Flat top (accurate level)' },
+          { id: 'KAIS', label: 'Kaiser' },
+          { id: 'RECT', label: 'Rectangular' },
+        ],
+        help: '**Low side lobe** keeps the skirts of a strong transmitter from burying a weak carrier beside it — the usual problem next to a TV channel. **Flat top** is the one to pick when the number on the marker has to be right.',
+      },
+      {
+        id: 'spurRejection',
+        type: 'dropdown',
+        label: 'Spur rejection',
+        default: 'ON',
+        choices: [
+          { id: 'OFF', label: 'Off (fastest)' },
+          { id: 'ON', label: 'On' },
+          { id: 'HIGH', label: 'High' },
+        ],
+        help: "Suppresses the analyzer's own internally generated spurs, so you do not go hunting an interferer that is inside the instrument. It costs sweep speed: the manual's headline sweep rates are all quoted with this off.",
+      },
+      {
+        id: 'attenDb',
+        type: 'dropdown',
+        label: 'Input attenuation',
+        default: 'auto',
+        choices: [
+          { id: 'auto', label: 'Auto' },
+          { id: '0', label: '0 dB' },
+          { id: '10', label: '10 dB' },
+          { id: '20', label: '20 dB' },
+          { id: '30', label: '30 dB' },
+        ],
+        help: 'Raise this if a strong local transmitter is compressing the front end. Auto follows the reference level.',
+      },
+      {
+        id: 'detector',
+        type: 'dropdown',
+        label: 'Detector',
+        default: 'POS',
+        choices: [
+          { id: 'POS', label: 'Peak' },
+          { id: 'NEGA', label: 'Negative peak' },
+          { id: 'AVER', label: 'Average' },
+          { id: 'RMS', label: 'RMS' },
+          { id: 'MAXP', label: 'Max power' },
+          { id: 'NORM', label: 'Sample' },
+        ],
+        help: 'Peak is what frequency coordination wants: the detector that will not miss a narrow carrier sitting between two points.',
+      },
+      {
+        id: 'preamp',
+        type: 'dropdown',
+        label: 'Preamplifier',
+        default: 'AUTO',
+        choices: [
+          { id: 'AUTO', label: 'Auto' },
+          { id: 'OFF', label: 'Off' },
+          { id: 'LOW', label: 'Low' },
+          { id: 'MEDIUM', label: 'Medium' },
+          { id: 'HIGH', label: 'High' },
+        ],
+        help: 'Lifts weak signals out of the noise. It also drops the maximum safe input from 23 dBm to 10 dBm, so switch it off when working close to transmitters.',
+      },
+    ];
+  }
+
+  /**
+   * Find the ends of this unit's tuning range by asking for more than any
+   * instrument has and reading back what it clamped to.
+   *
+   * `*IDN?` reports a literal "Hardware" where the model name would be, so
+   * there is nothing to look a range up by. Measuring it means one adapter
+   * serves a PXN-45, a PXN-90 and a rack NX without an edit. The user's own
+   * start and stop are restored before this returns, and a failure anywhere
+   * leaves the conservative fallback in place rather than inviting them past
+   * what the hardware can do.
+   */
+  async #measureRange() {
+    let restoreStart;
+    let restoreStop;
+    try {
+      restoreStart = await this.client.number('FREQ:STAR');
+      restoreStop = await this.client.number('FREQ:STOP');
+
+      const maxHz = await this.client.settleNumber('FREQ:STOP', PROBE_HIGH_HZ);
+      const minHz = await this.client.settleNumber('FREQ:STAR', PROBE_LOW_HZ);
+
+      if (!isNum(minHz) || !isNum(maxHz) || minHz >= maxHz) {
+        return { minHz: FALLBACK_MIN_HZ, maxHz: FALLBACK_MAX_HZ };
+      }
+      return { minHz, maxHz };
+    } catch {
+      return { minHz: FALLBACK_MIN_HZ, maxHz: FALLBACK_MAX_HZ };
+    } finally {
+      try {
+        if (isNum(restoreStart) && isNum(restoreStop)) {
+          await this.client.write(`FREQ:STAR ${Math.round(restoreStart)}`);
+          await this.client.write(`FREQ:STOP ${Math.round(restoreStop)}`);
+        }
+      } catch {
+        // the first applyConfig sets a span of its own anyway
+      }
+    }
+  }
+
+  /**
+   * Apply what was asked for and report what is actually in force.
+   *
+   * Clamp, never reject: a 400 makes a working plugin look broken, while a
+   * clamped value tells the user what the instrument can do. Fields absent
+   * from `cfg` are unchanged, and `cfg.controls` is merged by id.
+   */
+  async applyConfig(cfg = {}) {
+    const previous = this.effective ?? { controls: {} };
+    const controls = { ...previous.controls, ...(cfg.controls ?? {}) };
+    const { minHz, maxHz } = this.range;
+
+    const wantStart = clamp(
+      isNum(cfg.startHz) ? cfg.startHz : (previous.startHz ?? DEFAULT_START_HZ),
+      minHz,
+      maxHz
+    );
+    const wantStop = clamp(
+      isNum(cfg.stopHz) ? cfg.stopHz : (previous.stopHz ?? DEFAULT_STOP_HZ),
+      wantStart,
+      maxHz
+    );
+
+    // Move the far end first, so the instrument never sees a start above its
+    // stop and clamps the span on the way past.
+    let startHz;
+    let stopHz;
+    if (wantStart >= (previous.stopHz ?? 0)) {
+      stopHz = await this.client.settleNumber('FREQ:STOP', Math.round(wantStop));
+      startHz = await this.client.settleNumber(
+        'FREQ:STAR',
+        Math.round(wantStart)
+      );
+    } else {
+      startHz = await this.client.settleNumber(
+        'FREQ:STAR',
+        Math.round(wantStart)
+      );
+      stopHz = await this.client.settleNumber('FREQ:STOP', Math.round(wantStop));
+    }
+
+    const wantPoints = clamp(
+      Math.round(
+        isNum(cfg.pointCount)
+          ? cfg.pointCount
+          : (previous.pointCount ?? this.defaultPoints)
+      ),
+      MIN_POINTS,
+      MAX_POINTS
+    );
+    await this.client.settleNumber('SWE:POIN', wantPoints);
+
+    const effective = {
+      startHz,
+      stopHz,
+      pointCount: wantPoints, // replaced below by the length of a real trace
+      controls,
+      resolved: {},
+    };
+    const span = Math.max(1, stopHz - startHz);
+
+    // --- resolution bandwidth ------------------------------------------------
+    //
+    // An RBW the user typed always wins. The mode only decides what "auto"
+    // means, and the tracking mode is the one that makes a single setting work
+    // across a 40 MHz UHF scan and a 1.5 GHz survey: one display point wide.
+    if (isNum(cfg.rbwHz)) {
+      await this.client.write('BAND:AUTO MANU');
+      effective.rbwHz = await this.client.settleNumber(
+        'BAND:RES',
+        clamp(cfg.rbwHz, MIN_BW_HZ, MAX_BW_HZ)
+      );
+    } else {
+      const mode = controls.rbwMode ?? 'tracking';
+      if (mode === 'tracking') {
+        const perPoint = clamp(span / wantPoints, MIN_BW_HZ, MAX_BW_HZ);
+        await this.client.write('BAND:AUTO MANU');
+        effective.resolved.rbwHz = await this.client.settleNumber(
+          'BAND:RES',
+          tidy(perPoint)
+        );
+      } else {
+        const word =
+          mode === 'span1000'
+            ? 'ONETHOU'
+            : mode === 'span100'
+              ? 'ONEPER'
+              : 'AUTO';
+        await this.client.write(`BAND:AUTO ${word}`);
+        effective.resolved.rbwHz = await this.client.number('BAND:RES');
+      }
+    }
+
+    // --- video bandwidth -----------------------------------------------------
+    if (isNum(cfg.vbwHz)) {
+      await this.client.write('BWID:VID:AUTO MANU');
+      effective.vbwHz = await this.client.settleNumber(
+        'BWID:VID',
+        clamp(cfg.vbwHz, MIN_BW_HZ, MAX_BW_HZ)
+      );
+    } else {
+      const word =
+        {
+          equal: 'EQUALToRBW',
+          tenth: 'TENPERcentRBW',
+          hundredth: 'ONEPERcentRBW',
+        }[controls.vbwMode ?? 'tentimes'] ?? 'TENTIMEsRBW';
+      await this.client.write(`BWID:VID:AUTO ${word}`);
+      effective.resolved.vbwHz = await this.client.number('BWID:VID');
+    }
+
+    // --- amplitude -----------------------------------------------------------
+    const askedRefLevel = isNum(cfg.refLevelDbm)
+      ? cfg.refLevelDbm
+      : isNum(Number(controls.refLevelDbm))
+        ? Number(controls.refLevelDbm)
+        : undefined;
+    if (isNum(askedRefLevel)) {
+      effective.refLevelDbm = await this.client.settleNumber(
+        'DISP:TRAC:Y:SCAL:RLEV',
+        Math.round(clamp(askedRefLevel, MIN_REF_LEVEL_DBM, MAX_REF_LEVEL_DBM))
+      );
+      effective.controls.refLevelDbm = effective.refLevelDbm;
+    }
+
+    if (controls.attenDb !== undefined) {
+      // -1 is HAROGIC's "automatic", linked to the reference level.
+      const asked = controls.attenDb === 'auto' ? -1 : Number(controls.attenDb);
+      const atten = await this.client.settleNumber(
+        'INP:ATT',
+        Math.round(isNum(asked) ? asked : -1)
+      );
+      effective.controls.attenDb = atten < 0 ? 'auto' : String(atten);
+    }
+    if (controls.preamp !== undefined) {
+      await this.client.write(`INP:GAIN:STAT ${controls.preamp}`);
+    }
+
+    // --- acquisition ---------------------------------------------------------
+    if (controls.detector !== undefined) {
+      await this.client.write(`DET ${controls.detector}`);
+    }
+    if (controls.sweepDwell !== undefined) {
+      await this.client.write(`SWE:TIME:AUTO ${controls.sweepDwell}`);
+    }
+    if (controls.fftWindow !== undefined) {
+      await this.client.write(`SWE:FFT:WIND:TYPE ${controls.fftWindow}`);
+    }
+    if (controls.spurRejection !== undefined) {
+      await this.client.write(
+        `DISP:WIND:TRAC:SPUR:SUPP ${controls.spurRejection}`
+      );
+    }
+
+    // How long one sweep takes at these settings. Without it SoundBase has to
+    // learn the instrument's speed from its sweeps, and a slow first sweep
+    // reads as a stall. The dwell multiplier above can make this seconds.
+    const sweepSeconds = await this.client.number('SWE:TIME');
+    if (isNum(sweepSeconds)) {
+      effective.resolved.sweepTimeMs = Math.round(sweepSeconds * 1000);
+    }
+
+    // The point count the instrument settles on is not always the one it was
+    // asked for, and a trace whose length disagrees with the configuration is
+    // the classic cause of a plot that looks right and is shifted in
+    // frequency. One real trace settles it.
+    const trace = await this.client.trace();
+    effective.pointCount = trace.length;
+
+    if (Object.keys(effective.resolved).length === 0) delete effective.resolved;
+    this.effective = effective;
+    return effective;
+  }
+
+  /**
+   * Sweep until told to stop, calling `onTrace(amplitudesDbm)` once per
+   * completed sweep: one array of numbers in dBm, ordered from startHz to
+   * stopHz. The shell builds the frequency axis, the sweep id, the timestamp
+   * and the trace-mode accumulation from the effective configuration.
+   *
+   * A loop rather than setInterval, so an instrument slower than the interval
+   * cannot pile up overlapping reads on one socket.
+   */
+  async startSweep(onTrace) {
+    if (this.sweeping) return;
+    this.sweeping = true;
+    (async () => {
+      while (this.sweeping) {
+        try {
+          const amplitudes = await this.client.trace();
+          if (!this.sweeping) return;
+          // A trace of the wrong length would draw a frequency-shifted plot.
+          // Skipping it keeps the last good one on screen until applyConfig
+          // catches up, which is what a reconfigure in flight looks like.
+          if (amplitudes.length === this.effective?.pointCount) {
+            onTrace(amplitudes);
+          }
+          if (this.sweepIntervalMs > 0) await delay(this.sweepIntervalMs);
+        } catch (err) {
+          // One bad read is not necessarily a dead instrument; the client's
+          // own close and error handling calls onFatal when it really is.
+          if (!this.sweeping) return;
+          this.onFatal?.(err);
+          return;
+        }
+      }
+    })();
+  }
+
+  async stopSweep() {
+    this.sweeping = false;
+  }
+
+  /** Release the transport. Called on removal, teardown, and after a fatal. */
+  async close() {
+    this.sweeping = false;
+    this.client?.close();
+    this.client = null;
+  }
+}
+
+/**
+ * `device.config` holds the manifest's `deviceConfigFields`, filled in from the
+ * SoundBase project. The id fallback covers a device this plugin discovered
+ * itself, whose id already encodes the address.
+ */
+function addressOf(device) {
+  const config = device.config ?? {};
+  if (config.host) {
+    return { host: config.host, port: Number(config.port) || DEFAULT_PORT };
+  }
+  const match = /^net:([^:]+)(?::(\d+))?$/.exec(device.id ?? '');
+  if (match) return { host: match[1], port: Number(match[2]) || DEFAULT_PORT };
+  throw new Error(
+    `device ${device.id} has no address: set "IP address" in its configuration`
+  );
 }
