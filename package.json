@@ -1,6 +1,6 @@
 {
   "name": "soundbase-plugin-modorf-harogic",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "SoundBase plugin for HAROGIC spectrum analyzers (SA / NX / PX series) over SCPI.",
   "license": "BUSL-1.1",
   "type": "module",
