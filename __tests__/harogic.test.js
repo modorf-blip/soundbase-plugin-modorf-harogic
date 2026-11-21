@@ -256,6 +256,37 @@ test('auto point count follows the span, and never the last sweep', async () => 
   }
 });
 
+test('a point count past what the filter can resolve never reaches the instrument', async () => {
+  // Measured on a PXN-45 on 2026-11-21: 470-900 MHz at RBW 200 kHz sweeps at
+  // 6451 points and stops answering at 12000. It neither clamps nor reports
+  // an error, so not sending the number is the only protection there is.
+  //
+  // Driven against the adapter directly so that a regression wedges this one
+  // fake connection rather than every test after it.
+  const [device] = await discoverDevices({ addresses: ADDRESS });
+  const adapter = createSpectrumAnalyzerAdapter(device, {});
+  await adapter.open();
+
+  try {
+    const asked = await adapter.applyConfig({
+      startHz: 470e6,
+      stopHz: 900e6,
+      rbwHz: 200_000,
+      pointCount: 12_000,
+    });
+    assert.ok(
+      asked.pointCount <= 6_452,
+      `${asked.pointCount} points went to the instrument; the ceiling is 6451`
+    );
+
+    // and it is still answering, which is the whole point
+    const after = await adapter.applyConfig({ startHz: 470e6, stopHz: 900e6 });
+    assert.ok(after.pointCount > 0, 'the instrument stopped answering');
+  } finally {
+    await adapter.close();
+  }
+});
+
 test('the point count is not clipped by the filter the last sweep left behind', async () => {
   // The instrument will not hand out points closer together than the filter
   // in force can tell them apart. Ask for them while the previous

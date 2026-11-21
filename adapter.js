@@ -50,6 +50,27 @@ const MIN_POINTS = 2;
 // The floor keeps a narrow span from being drawn with fewer points than the
 // plot has pixels; the ceiling is MAX_POINTS, and a span wide enough to hit
 // it simply gets the best spacing the instrument will give.
+// The most trace points this instrument will survive being asked for, as a
+// multiple of how many of its resolution-bandwidth filters fit across the
+// span. Three measurements per filter width is the ordinary engineering
+// choice: enough that successive looks overlap, so no carrier falls on a
+// skirt and reads low.
+//
+// It is a hard limit here rather than a quality setting because of what
+// happens past it. Measured on a PXN-45, 2026-11-21, 470-900 MHz at
+// RBW 200 kHz — a ceiling of 6451:
+//
+//   6451 points    sweeps normally
+//   12000 points   the instrument stops answering; the plugin hangs waiting
+//                  for a trace and the host gives up on the device
+//
+// It does not clamp and carry on, and it does not report an error. An
+// earlier session wedged the same unit with a point count of one million and
+// had to restart its SCPI service by hand. MAX_POINTS alone is not enough to
+// prevent that: 16384 is below what wedged it then and far above what wedges
+// it at a wide RBW.
+const POINTS_PER_RBW = 3;
+
 const AUTO_SPACING_HZ = 50_000;
 const AUTO_SPACING_WIDE_HZ = 100_000;
 const AUTO_WIDE_SPAN_HZ = 500_000_000;
@@ -562,17 +583,24 @@ class HarogicAnalyzerAdapter {
 
     // --- point count ---------------------------------------------------------
     //
-    // After the RBW, and that ordering is the whole point. The instrument
-    // will not hand out more points than the filter in force can tell apart —
-    // on a PXN-45 the ceiling is about three points per RBW — so a request
-    // made while the *previous* configuration's wider filter is still loaded
-    // comes back clamped, and stays clamped once the narrower RBW arrives a
-    // moment later. A 40 MHz span asked for 2000 points under a leftover
-    // 200 kHz filter is handed 601 of them.
+    // Sent last, because the ceiling that protects the instrument is a
+    // function of the resolution bandwidth, and only now is that settled.
     //
-    // Observed on the instrument: 40 MHz at RBW 200 kHz yields exactly 601
-    // points, which is 66.6 kHz apart — one third of the RBW.
-    await this.client.settleNumber('SWE:POIN', wantPoints);
+    // Past the ceiling the unit stops answering rather than clamping — see
+    // POINTS_PER_RBW. So this is not tidying up a number for the look of it:
+    // letting one through costs the user their analyzer mid-show.
+    const rbwInForce = effective.rbwHz ?? effective.resolved.rbwHz;
+    const ceiling =
+      isNum(rbwInForce) && rbwInForce > 0
+        ? Math.floor((POINTS_PER_RBW * span) / rbwInForce) + 1
+        : MAX_POINTS;
+    const sendPoints = clamp(
+      wantPoints,
+      MIN_POINTS,
+      Math.min(MAX_POINTS, Math.max(MIN_POINTS, ceiling))
+    );
+    effective.pointCount = sendPoints; // replaced below by a real trace length
+    await this.client.settleNumber('SWE:POIN', sendPoints);
 
     // --- video bandwidth -----------------------------------------------------
     if (isNum(cfg.vbwHz)) {

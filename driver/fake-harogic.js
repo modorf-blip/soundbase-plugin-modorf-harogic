@@ -64,23 +64,28 @@ const ENUMS = {
 };
 
 /**
- * The most trace points the instrument will hand out at the resolution
- * bandwidth currently in force.
+ * The most trace points the instrument survives being asked for at the
+ * resolution bandwidth in force: three per filter width.
  *
- * Measured on a PXN-45: a 40 MHz span at RBW 200 kHz settles on 601 points,
- * 66.6 kHz apart — one third of the RBW. Points closer together than that
- * would be three looks through the same filter, so it declines to produce
- * them, whatever is asked for.
+ * Measured on a PXN-45 on 2026-11-21, 470-900 MHz at RBW 200 kHz, where the
+ * ceiling works out to 6451. At 6451 it sweeps; at 12000 it stops answering
+ * and has to be recovered by hand. An earlier session wedged the same unit
+ * with a point count of one million.
  *
- * Reproduced here because it is what makes the order of SWE:POIN and
- * BAND:RES matter, and an adapter that gets that order wrong looks perfectly
- * healthy against a fake that hands out whatever it is asked for.
+ * Note what it does *not* do: clamp, or report an error. That is why the
+ * adapter has to work the ceiling out for itself, and why this fake wedges
+ * rather than quietly handing back a smaller number — against a forgiving
+ * fake, an adapter with no ceiling looks perfectly healthy.
  */
+// Three measurements per filter width, plus one: the same fence-post count
+// SoundBase itself makes when it sizes a sweep from an RBW, and the same one
+// the adapter has to make to stay under this.
 const POINTS_PER_RBW = 3;
 const pointCeiling = (state) =>
   Math.max(
     2,
-    Math.floor((POINTS_PER_RBW * (state.stopHz - state.startHz)) / state.rbwHz)
+    Math.floor((POINTS_PER_RBW * (state.stopHz - state.startHz)) / state.rbwHz) +
+      1
   );
 
 /** `NUTTall` -> `NUTT`: the leading run of capitals and digits. */
@@ -171,6 +176,12 @@ function handle(line, state) {
   const command = (space < 0 ? line : line.slice(0, space)).toUpperCase();
   const argument = space < 0 ? '' : line.slice(space + 1).trim();
 
+  // Wedged: the socket stays up and nothing is ever answered again, which is
+  // what a PXN-45 does when it has been asked for a point count it cannot
+  // produce. Nothing short of restarting its SCPI service brings it back,
+  // so there is deliberately no way to clear this from the wire.
+  if (state.wedged) return null;
+
   switch (command) {
     case '*IDN?':
       return 'HTRA,Hardware,57465013002b003a,A:0_55_89,F:0_55_103,M:0_55_103S0_55_103';
@@ -197,16 +208,20 @@ function handle(line, state) {
     case 'FREQ:STOP?':
       return String(state.stopHz);
 
-    case 'SWE:POIN':
-      // the real instrument settles on something near what it was asked for,
-      // and will not go finer than the filter in force can tell apart
-      state.points =
-        clamp(
-          Math.round(Number(argument)),
-          2,
-          Math.min(MAX_POINTS, pointCeiling(state))
-        ) | 1;
+    case 'SWE:POIN': {
+      const asked = Math.round(Number(argument));
+      // Past what the filter in force can resolve, the instrument does not
+      // clamp and it does not complain: it stops answering altogether. This
+      // is the failure the adapter's own ceiling exists to prevent, so the
+      // fake has to be capable of it or no test can prove the guard works.
+      if (asked > pointCeiling(state) || asked > MAX_POINTS) {
+        state.wedged = true;
+        return null;
+      }
+      // otherwise it settles on something near what it was asked for
+      state.points = clamp(asked, 2, MAX_POINTS) | 1;
       return null;
+    }
     case 'SWE:POIN?':
       return String(state.points);
 

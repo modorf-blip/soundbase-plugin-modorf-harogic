@@ -18,7 +18,7 @@ PXN-45, a PXN-90 and a rack NX without an edit.
 | RBW / VBW | continuous, 0.1 Hz – 10 MHz, with automatic modes that track the span |
 | Reference level | −70 to +23 dBm |
 | Controls | reference level, RBW mode, VBW mode, dwell per sweep, FFT window, spur rejection, LO optimization, input attenuation, detector, preamplifier |
-| Point count | sized from the span when left on auto, clamped to 16384 |
+| Point count | sized from the span when left on auto, and never more than three per RBW — see below |
 | Trace modes | Clear/Write on the instrument — SoundBase accumulates max-hold and averaging itself, at the full sweep rate |
 
 ### RBW that follows the span
@@ -53,7 +53,33 @@ a coordinator is separating UHF carriers a couple of hundred kHz wide, and
 finer spacing buys sweep time and no information. Never fewer than 2000
 points, never more than 16384.
 
-Type a number and yours is used instead.
+Type a number and yours is used instead — up to a ceiling the plugin will not
+let you past.
+
+### The point-count ceiling, and why it is not negotiable
+
+An instrument will not produce trace points closer together than the filter
+in force can tell apart. Three measurements per RBW is the usual engineering
+choice, and it is what SoundBase itself assumes when it sizes a sweep from an
+RBW: across 430 MHz at RBW 200 kHz that comes to 6451 points.
+
+What matters is what a PXN-45 does when it is asked for more. Measured on
+2026-11-21, on that exact span and RBW:
+
+| Points asked for | What happened |
+|---|---|
+| 6451 | sweeps normally |
+| 12000 | the instrument stops answering, and has to be recovered by hand |
+
+It does not clamp. It does not report an error. It goes quiet, the plugin
+hangs waiting for a trace, and the host gives up on the device — which, in a
+show, is the analyzer gone until someone restarts its SCPI service.
+
+So the plugin works the ceiling out for itself from the RBW it just applied,
+and clamps to it before `SWE:POIN` ever goes out. A point count beyond it
+does not reach the instrument. The fake analyzer reproduces the failure, so a
+regression here fails the test suite loudly rather than waiting to be found
+on a show day.
 
 ### Two controls that sound alike and are not
 
