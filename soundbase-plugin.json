@@ -2,7 +2,7 @@
   "manifestVersion": 1,
   "id": "modorf-harogic",
   "name": "ModoRF — HAROGIC Spectrum Analyzers",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "license": "MIT",
   "platforms": [
     "darwin-arm64",

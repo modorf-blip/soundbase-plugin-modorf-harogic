@@ -33,6 +33,58 @@ const DWELL = {
   SWT50: 50,
 };
 
+// The documented vocabularies, written the way the SCPI Application Guide
+// V4.55.64 prints them (§6.2.37, .39, .44, .51, .57): capitals are the short
+// form, the whole word is the long one, and a query answers with the long
+// one in quotes. Both spellings are accepted, nothing else is.
+const ENUMS = {
+  dwell: [
+    'MANUal',
+    'SWT',
+    'SWT2',
+    'SWT4',
+    'SWT10',
+    'SWT20',
+    'SWT50',
+    'SWTN',
+    'SMPN',
+  ],
+  fftWindow: ['FLATop', 'NUTTall', 'LOWSideLobe', 'RECT', 'KAISer'],
+  spurRejection: ['OFF', 'ON', 'HIGH'],
+  detector: [
+    'NORMal',
+    'POSitive',
+    'AVERage',
+    'NEGAtive',
+    'MAXPower',
+    'RMS',
+    'RAW',
+  ],
+  preamp: ['AUTO', 'OFF', 'LOW', 'MEDIUM', 'HIGH'],
+};
+
+/** `NUTTall` -> `NUTT`: the leading run of capitals and digits. */
+const shortForm = (word) => word.match(/^[A-Z0-9]*/)[0];
+
+/**
+ * Resolve what was sent to the spelling the instrument would answer with, or
+ * null if it is not in the vocabulary.
+ *
+ * A real instrument given an enum it does not implement ignores the line and
+ * keeps the value it had — and says nothing, because settings draw no reply.
+ * Reproducing that is the whole point: it is the failure a plugin cannot see
+ * unless it reads the value back.
+ */
+function resolveEnum(which, sent) {
+  const token = String(sent).trim().toUpperCase();
+  return (
+    ENUMS[which].find(
+      (word) =>
+        word.toUpperCase() === token || shortForm(word).toUpperCase() === token
+    ) ?? null
+  );
+}
+
 export async function startFakeHarogic({ port = 0 } = {}) {
   const state = {
     mode: 'SWP',
@@ -46,10 +98,10 @@ export async function startFakeHarogic({ port = 0 } = {}) {
     vbwAuto: 'TENTIMEsRBW',
     refLevelDbm: 0,
     attenDb: -1,
-    detector: 'POS',
+    detector: 'POSitive',
     preamp: 'AUTO',
     dwell: 'SWT',
-    fftWindow: 'NUTT',
+    fftWindow: 'NUTTall',
     spurRejection: 'ON',
     traceFormat: 0,
     traceType: 'WRIT',
@@ -132,7 +184,7 @@ function handle(line, state) {
       return String(state.points);
 
     case 'SWE:TIME:AUTO':
-      state.dwell = argument.toUpperCase();
+      state.dwell = resolveEnum('dwell', argument) ?? state.dwell;
       return null;
     case 'SWE:TIME:AUTO?':
       return `"${state.dwell}"`;
@@ -140,7 +192,7 @@ function handle(line, state) {
       return String(BASE_SWEEP_SECONDS * (DWELL[state.dwell] ?? 1));
 
     case 'SWE:FFT:WIND:TYPE':
-      state.fftWindow = argument.toUpperCase();
+      state.fftWindow = resolveEnum('fftWindow', argument) ?? state.fftWindow;
       return null;
     case 'SWE:FFT:WIND:TYPE?':
       return `"${state.fftWindow}"`;
@@ -190,7 +242,8 @@ function handle(line, state) {
       return String(state.refLevelDbm);
 
     case 'DISP:WIND:TRAC:SPUR:SUPP':
-      state.spurRejection = argument.toUpperCase();
+      state.spurRejection =
+        resolveEnum('spurRejection', argument) ?? state.spurRejection;
       return null;
     case 'DISP:WIND:TRAC:SPUR:SUPP?':
       return `"${state.spurRejection}"`;
@@ -202,13 +255,13 @@ function handle(line, state) {
       return String(state.attenDb);
 
     case 'DET':
-      state.detector = argument.toUpperCase();
+      state.detector = resolveEnum('detector', argument) ?? state.detector;
       return null;
     case 'DET?':
       return `"${state.detector}"`;
 
     case 'INP:GAIN:STAT':
-      state.preamp = argument.toUpperCase();
+      state.preamp = resolveEnum('preamp', argument) ?? state.preamp;
       return null;
     case 'INP:GAIN:STAT?':
       return `"${state.preamp}"`;

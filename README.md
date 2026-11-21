@@ -18,7 +18,7 @@ PXN-45, a PXN-90 and a rack NX without an edit.
 | RBW / VBW | continuous, 0.1 Hz – 10 MHz, with automatic modes that track the span |
 | Reference level | −70 to +23 dBm |
 | Controls | reference level, RBW mode, VBW mode, dwell per sweep, FFT window, spur rejection, input attenuation, detector, preamplifier |
-| Point count | adopted from the instrument at connect, clamped to 16384 |
+| Point count | sized from the span when left on auto, clamped to 16384 |
 | Trace modes | Clear/Write on the instrument — SoundBase accumulates max-hold and averaging itself, at the full sweep rate |
 
 ### RBW that follows the span
@@ -27,12 +27,13 @@ The control worth knowing about. Set **RBW when set to auto** to *Track point
 spacing* and the plugin sizes the filter to roughly one display point wide
 every time the span changes:
 
-| Span | Points | Point spacing | RBW chosen |
+| Span | Points (auto) | Point spacing | RBW chosen |
 |---|---|---|---|
-| 470–510 MHz | 4000 | 10 kHz | 10 kHz |
-| 470–900 MHz | 4000 | 108 kHz | 108 kHz |
-| 1.0–2.0 GHz | 4000 | 250 kHz | 250 kHz |
-| 900–2400 MHz | 4000 | 375 kHz | 375 kHz |
+| 470–510 MHz | 2000 | 20 kHz | 20 kHz |
+| 470–698 MHz | 4560 | 50 kHz | 50 kHz |
+| 470–900 MHz | 8600 | 50 kHz | 50 kHz |
+| 1.0–2.0 GHz | 10000 | 100 kHz | 100 kHz |
+| 900–2400 MHz | 15000 | 100 kHz | 100 kHz |
 
 which is the ratio you want across that whole range, because what you are
 looking for up at 2.4 GHz is wider than what you are looking for at 500 MHz.
@@ -40,6 +41,19 @@ The analyzer's own `span/1000` and `span/100` presets are offered too.
 
 **Typing an RBW always wins.** The mode only decides what *auto* means; put
 the host's RBW field back to auto to hand control back to it.
+
+### Point count that follows the span too
+
+Left on auto, the point count is sized from the span rather than fixed, for
+the same reason: 4000 points is 10 kHz apart across a 40 MHz scan and 375 kHz
+apart across a 1.5 GHz one, so the number on its own means nothing. Auto
+targets a spacing instead — **50 kHz per point** below 500 MHz of span, where
+a coordinator is separating UHF carriers a couple of hundred kHz wide, and
+**100 kHz** above it, where the occupants are WiFi, DECT and wideband IEM and
+finer spacing buys sweep time and no information. Never fewer than 2000
+points, never more than 16384.
+
+Type a number and yours is used instead.
 
 ### What it does not do
 
@@ -55,15 +69,33 @@ the host's RBW field back to auto to hand control back to it.
 
 ### What it has been tested against
 
-So far, only the fake analyzer in `driver/fake-harogic.js`, which reproduces
-the HAROGIC clamping, quantizing and reply behaviour described in the SCPI
-guide. **It has not yet been run against real hardware.** Until that line
-changes, treat it as untested on an instrument.
+**A HAROGIC PXN-45, over Ethernet, coordinating live events.** It sweeps,
+retunes, and holds a connection across a working session. Two things found
+that way are in the code because no fake would have produced them: the unit
+returns its trace array wrapped in quotes, and it stops answering SCPI
+altogether if asked for a point count far beyond what it expects — hence the
+16384 ceiling, which exists so nobody else has to power-cycle an analyzer
+mid-show to find that out.
+
+Confirmed on the instrument: connect and identify, range measurement, start
+and stop, point count, RBW and VBW in both automatic and manual modes,
+reference level, continuous sweeping, and the dwell multiplier.
+
+Everything else runs against the fake analyzer in `driver/fake-harogic.js`,
+which reproduces the clamping, quantizing and reply behaviour the SCPI guide
+describes — including answering in the long spelling and ignoring an enum it
+does not know.
 
 It is written against *SCPI Application Guide V4.55.64* and uses no command
-that guide does not document. Other models in the SA, NX and PX families
-should work — the plugin measures what it finds rather than assuming a model —
-but none has been tried. If you run one, say so in an issue.
+that guide does not document. The five enum controls are set and then read
+back, so if a firmware does not implement one, the value snaps back in
+SoundBase instead of silently doing nothing.
+
+Only the PXN-45 has been tried. Other models in the SA, NX and PX families
+should work — the plugin measures what it finds rather than assuming a model.
+The USB units should work too, pointed at whatever machine runs their
+SAStudio4, though nobody has confirmed that. If you run one, say so in an
+issue and this section grows.
 
 ## Trusting this plugin
 
@@ -169,3 +201,13 @@ Reference: *HAROGIC Spectrum Analyzer SCPI Application Guide V4.55.64*.
 
 Para trabajar en el código sin tener el analizador delante, `npm test` levanta
 un analizador falso y prueba todo el camino.
+
+---
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE). Use it, change it, ship it in your own work.
+
+The files this repository was generated from carry the SoundBase SDK's own
+licence, which is a different one; [`NOTICE`](NOTICE) says which files and
+what it permits.

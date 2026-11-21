@@ -1,0 +1,14 @@
+Note on the parts that are not ours
+===================================
+
+The MIT licence in LICENSE covers the work written for this plugin:
+adapter.js, driver/, __tests__/, soundbase-plugin.json and the documentation
+written for it.
+
+This repository was generated from soundbase-plugin-template, and the files
+that came with it — main.js, scripts/, docs/, examples/, .github/ and the
+@soundbase/plugin-contract and @soundbase/plugin-shell packages it depends on
+— remain under the Business Source License 1.1, Licensor Show Code, Corp.,
+which converts to the Apache License 2.0 on September 5, 2030. That licence's
+Additional Use Grant permits developing, distributing and operating plugins
+for SoundBase, including commercially.

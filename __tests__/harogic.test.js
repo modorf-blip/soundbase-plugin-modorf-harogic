@@ -202,12 +202,88 @@ test('the dwell multiplier slows the sweep and is reported', async () => {
 });
 
 test('window and spur rejection reach the instrument', async () => {
-  await configure({
+  const { body } = await configure({
     ...UHF,
     controls: { fftWindow: 'LOWS', spurRejection: 'HIGH' },
   });
-  assert.equal(instrument.state.fftWindow, 'LOWS');
+  // The instrument holds the long spelling its own SCPI guide prints, and
+  // answers queries with it; the host gets back the short id it asked with.
+  assert.equal(instrument.state.fftWindow, 'LOWSideLobe');
   assert.equal(instrument.state.spurRejection, 'HIGH');
+  assert.equal(body.controls.fftWindow, 'LOWS');
+  assert.equal(body.controls.spurRejection, 'HIGH');
+});
+
+test('auto point count follows the span, and never the last sweep', async () => {
+  // Driven against the adapter directly, not through the shell: once the host
+  // has sent a pointCount the shell keeps sending it (only `rbwHz` has a way
+  // to be cleared), so "auto" — the field absent — is a state reachable only
+  // before one has ever been set. Through the shell this would be testing the
+  // leftovers of whichever test ran first.
+  const [device] = await discoverDevices({ addresses: ADDRESS });
+  const adapter = createSpectrumAnalyzerAdapter(device, {});
+  await adapter.open();
+
+  const spacing = async (startHz, stopHz) => {
+    const e = await adapter.applyConfig({ startHz, stopHz });
+    return (e.stopHz - e.startHz) / e.pointCount;
+  };
+
+  try {
+    // 40 MHz comes to 800 points by the rule, so the floor decides instead
+    const narrow = await spacing(470e6, 510e6);
+    assert.ok(narrow < 25_000, `narrow spacing was ${narrow} Hz`);
+
+    // UHF: carriers a couple of hundred kHz wide, neighbours to tell apart
+    const uhf = await spacing(470e6, 900e6);
+    assert.ok(uhf > 45_000 && uhf < 55_000, `UHF spacing was ${uhf} Hz`);
+
+    // above the cut: WiFi, DECT and wideband IEM, megahertz across
+    const survey = await spacing(900e6, 2_400e6);
+    assert.ok(
+      survey > 90_000 && survey < 110_000,
+      `survey spacing was ${survey} Hz`
+    );
+
+    // and back down. The bug this guards against: an instrument that answers
+    // a request for 4000 points with 601 used to make 601 the new meaning of
+    // auto, and it stayed 601 when a far wider span was opened next.
+    const again = await spacing(470e6, 510e6);
+    assert.ok(again < 25_000, `spacing after a wide sweep was ${again} Hz`);
+  } finally {
+    await adapter.close();
+  }
+});
+
+test('a control the instrument will not take comes back as what it kept', async () => {
+  // The failure this guards against is silent: a setting draws no reply, so
+  // firmware that does not implement an option ignores the line and the host
+  // would go on displaying a value that never reached the instrument.
+  await configure({ ...UHF, controls: { fftWindow: 'LOWS' } });
+
+  const { body } = await configure({
+    ...UHF,
+    controls: { fftWindow: 'NOSUCHWINDOW' },
+  });
+
+  assert.equal(
+    instrument.state.fftWindow,
+    'LOWSideLobe',
+    'the instrument should have kept the window it had'
+  );
+  assert.equal(
+    body.controls.fftWindow,
+    'LOWS',
+    'the host should be told what the instrument kept, not what was asked'
+  );
+});
+
+test('the dwell multiplier is not confused with the plain multiplier', async () => {
+  // "SWT" is a prefix of "SWT20". Matching the reply loosely would report
+  // every multiplier as the fastest setting and look like a working control.
+  const { body } = await configure({ ...UHF, controls: { sweepDwell: 'SWT20' } });
+  assert.equal(body.controls.sweepDwell, 'SWT20');
+  assert.equal(instrument.state.dwell, 'SWT20');
 });
 
 test('controls are merged by id and echoed as the device settled on them', async () => {

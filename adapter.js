@@ -27,7 +27,6 @@ const PROBE_HIGH_HZ = 1e13;
 
 const DEFAULT_START_HZ = 470_000_000;
 const DEFAULT_STOP_HZ = 616_000_000;
-const FALLBACK_POINTS = 4_000;
 
 // A PXN-45 asked for a million points stops answering SCPI at all and has to
 // be power-cycled; its own default is 4000. This ceiling is far above anything
@@ -36,6 +35,36 @@ const FALLBACK_POINTS = 4_000;
 // host's field nor a badly behaved caller can take the analyzer down mid-show.
 const MAX_POINTS = 16_384;
 const MIN_POINTS = 2;
+
+// What "auto" means for the point count. The number itself says nothing — the
+// same 4000 points is 10 kHz apart across a 40 MHz scan and 375 kHz apart
+// across a 1.5 GHz one — so auto targets a *spacing* and derives the count
+// from the span in force.
+//
+// Two targets, because the two halves of the band hold different things.
+// Below the cut a coordinator is separating UHF carriers a couple of hundred
+// kHz wide, and wants to tell one candidate from its neighbour: 50 kHz.
+// Above it the occupants are WiFi, DECT and wideband IEM, megahertz across,
+// where finer spacing buys sweep time and no information: 100 kHz.
+//
+// The floor keeps a narrow span from being drawn with fewer points than the
+// plot has pixels; the ceiling is MAX_POINTS, and a span wide enough to hit
+// it simply gets the best spacing the instrument will give.
+const AUTO_SPACING_HZ = 50_000;
+const AUTO_SPACING_WIDE_HZ = 100_000;
+const AUTO_WIDE_SPAN_HZ = 500_000_000;
+const AUTO_MIN_POINTS = 2_000;
+
+// The dropdown controls that map to one SCPI enum each. Kept together because
+// they share a quirk: a setting draws no reply, so a command this firmware
+// happens not to implement is swallowed in silence. Each is read back.
+const CHOICE_COMMANDS = {
+  preamp: 'INP:GAIN:STAT',
+  detector: 'DET',
+  sweepDwell: 'SWE:TIME:AUTO',
+  fftWindow: 'SWE:FFT:WIND:TYPE',
+  spurRejection: 'DISP:WIND:TRAC:SPUR:SUPP',
+};
 
 // The instrument's own limits, from the PXN product manual.
 const MIN_BW_HZ = 0.1;
@@ -55,6 +84,24 @@ const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 /** three significant figures — the hardware is continuous, people are not */
 const tidy = (v) => Number(v.toPrecision(3));
+
+/**
+ * The point count `auto` resolves to for a given span. See AUTO_SPACING_HZ.
+ *
+ * Deliberately a function of the span alone, and never of the last sweep:
+ * an instrument that quantises 4000 points down to 601 would otherwise make
+ * 601 the new meaning of auto, and it would stay 601 when the user opened a
+ * span seven times wider.
+ */
+const autoPoints = (spanHz) =>
+  clamp(
+    Math.ceil(
+      spanHz /
+        (spanHz > AUTO_WIDE_SPAN_HZ ? AUTO_SPACING_WIDE_HZ : AUTO_SPACING_HZ)
+    ),
+    AUTO_MIN_POINTS,
+    MAX_POINTS
+  );
 
 const delay = (ms) =>
   new Promise((resolve) => {
@@ -127,7 +174,7 @@ class HarogicAnalyzerAdapter {
       : DEFAULT_SWEEP_INTERVAL_MS;
     this.client = null;
     this.range = { minHz: FALLBACK_MIN_HZ, maxHz: FALLBACK_MAX_HZ };
-    this.defaultPoints = FALLBACK_POINTS;
+    this.choiceIds = null; // filled lazily from the declared controls
     this.effective = null;
     this.sweeping = false;
     /** assigned by the shell; call it when the transport dies unprompted */
@@ -165,14 +212,6 @@ class HarogicAnalyzerAdapter {
     await this.client.write('TRAC:DATA:TYPE ASC8');
     await this.client.write('TRAC:TYPE WRIT');
     await this.client.write('INIT:MODE CONT');
-
-    // Adopt the instrument's own point count as the default rather than
-    // imposing one: a PXN-45 boots at 4000, and that is a number its firmware
-    // is known to be happy with.
-    const points = await this.client.number('SWE:POIN');
-    if (isNum(points) && points >= MIN_POINTS) {
-      this.defaultPoints = Math.min(Math.round(points), MAX_POINTS);
-    }
 
     this.range = await this.#measureRange();
 
@@ -326,6 +365,50 @@ class HarogicAnalyzerAdapter {
   }
 
   /**
+   * Apply one dropdown control, then report what the instrument actually
+   * holds rather than what was asked for.
+   *
+   * Settings draw no reply on this protocol, so a command the firmware does
+   * not implement is accepted in silence and the host goes on displaying a
+   * value that never reached the instrument. Asking afterwards is the only
+   * way anyone — user or author — finds out.
+   *
+   * The reply comes back in the long form the SCPI guide prints: a `NUTT`
+   * that was sent reads back as `"NUTTall"`, and a `SWT20` as `"SWT20"`. So
+   * the reply is matched against the ids this adapter declares, longest
+   * first — `SWT` is a prefix of `SWT20`, and the short one must not win.
+   *
+   * A reply that matches nothing declared, or a query that goes unanswered,
+   * falls back to reporting what was asked: the set itself already went out,
+   * so that is the behaviour this plugin had before it read anything back.
+   * A control is never allowed to fail the whole of applyConfig.
+   */
+  async #settleChoice(id, asked) {
+    const command = CHOICE_COMMANDS[id];
+    try {
+      const real = await this.client.settle(command, asked);
+      if (typeof real !== 'string' || real === '') return asked;
+      const reply = real.toUpperCase();
+      const matched = this.#choiceIds(id)
+        .filter((choice) => reply.startsWith(choice.toUpperCase()))
+        .sort((a, b) => b.length - a.length)[0];
+      return matched ?? asked;
+    } catch {
+      return asked;
+    }
+  }
+
+  /** The ids declared for one dropdown control, cached on first use. */
+  #choiceIds(id) {
+    this.choiceIds ??= Object.fromEntries(
+      this.#controls()
+        .filter((control) => Array.isArray(control.choices))
+        .map((control) => [control.id, control.choices.map((c) => c.id)])
+    );
+    return this.choiceIds[id] ?? [];
+  }
+
+  /**
    * Find the ends of this unit's tuning range by asking for more than any
    * instrument has and reading back what it clamped to.
    *
@@ -405,12 +488,10 @@ class HarogicAnalyzerAdapter {
       stopHz = await this.client.settleNumber('FREQ:STOP', Math.round(wantStop));
     }
 
+    const span = Math.max(1, stopHz - startHz);
+
     const wantPoints = clamp(
-      Math.round(
-        isNum(cfg.pointCount)
-          ? cfg.pointCount
-          : (previous.pointCount ?? this.defaultPoints)
-      ),
+      Math.round(isNum(cfg.pointCount) ? cfg.pointCount : autoPoints(span)),
       MIN_POINTS,
       MAX_POINTS
     );
@@ -423,7 +504,6 @@ class HarogicAnalyzerAdapter {
       controls,
       resolved: {},
     };
-    const span = Math.max(1, stopHz - startHz);
 
     // --- resolution bandwidth ------------------------------------------------
     //
@@ -498,24 +578,14 @@ class HarogicAnalyzerAdapter {
       );
       effective.controls.attenDb = atten < 0 ? 'auto' : String(atten);
     }
-    if (controls.preamp !== undefined) {
-      await this.client.write(`INP:GAIN:STAT ${controls.preamp}`);
-    }
-
-    // --- acquisition ---------------------------------------------------------
-    if (controls.detector !== undefined) {
-      await this.client.write(`DET ${controls.detector}`);
-    }
-    if (controls.sweepDwell !== undefined) {
-      await this.client.write(`SWE:TIME:AUTO ${controls.sweepDwell}`);
-    }
-    if (controls.fftWindow !== undefined) {
-      await this.client.write(`SWE:FFT:WIND:TYPE ${controls.fftWindow}`);
-    }
-    if (controls.spurRejection !== undefined) {
-      await this.client.write(
-        `DISP:WIND:TRAC:SPUR:SUPP ${controls.spurRejection}`
-      );
+    // --- the enum controls ---------------------------------------------------
+    //
+    // Preamplifier, detector, dwell, FFT window and spur rejection. Each is
+    // set and then read back, so what the host displays is what the
+    // instrument holds — see #settleChoice for why that is not optional.
+    for (const id of Object.keys(CHOICE_COMMANDS)) {
+      if (controls[id] === undefined) continue;
+      effective.controls[id] = await this.#settleChoice(id, controls[id]);
     }
 
     // How long one sweep takes at these settings. Without it SoundBase has to
