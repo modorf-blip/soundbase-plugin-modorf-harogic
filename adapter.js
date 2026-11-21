@@ -490,12 +490,13 @@ class HarogicAnalyzerAdapter {
 
     const span = Math.max(1, stopHz - startHz);
 
+    // Worked out here but not sent until the resolution bandwidth is in
+    // place — see the note above SWE:POIN below for why the order matters.
     const wantPoints = clamp(
       Math.round(isNum(cfg.pointCount) ? cfg.pointCount : autoPoints(span)),
       MIN_POINTS,
       MAX_POINTS
     );
-    await this.client.settleNumber('SWE:POIN', wantPoints);
 
     const effective = {
       startHz,
@@ -536,6 +537,20 @@ class HarogicAnalyzerAdapter {
         effective.resolved.rbwHz = await this.client.number('BAND:RES');
       }
     }
+
+    // --- point count ---------------------------------------------------------
+    //
+    // After the RBW, and that ordering is the whole point. The instrument
+    // will not hand out more points than the filter in force can tell apart —
+    // on a PXN-45 the ceiling is about three points per RBW — so a request
+    // made while the *previous* configuration's wider filter is still loaded
+    // comes back clamped, and stays clamped once the narrower RBW arrives a
+    // moment later. A 40 MHz span asked for 2000 points under a leftover
+    // 200 kHz filter is handed 601 of them.
+    //
+    // Observed on the instrument: 40 MHz at RBW 200 kHz yields exactly 601
+    // points, which is 66.6 kHz apart — one third of the RBW.
+    await this.client.settleNumber('SWE:POIN', wantPoints);
 
     // --- video bandwidth -----------------------------------------------------
     if (isNum(cfg.vbwHz)) {

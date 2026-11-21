@@ -255,6 +255,32 @@ test('auto point count follows the span, and never the last sweep', async () => 
   }
 });
 
+test('the point count is not clipped by the filter the last sweep left behind', async () => {
+  // The instrument will not hand out points closer together than the filter
+  // in force can tell them apart. Ask for them while the previous
+  // configuration's wider RBW is still loaded and they come back clamped —
+  // and they stay clamped when the narrow RBW lands a moment later. On a
+  // PXN-45 that turned 2000 points across 40 MHz into 601.
+  await configure({
+    startHz: 470e6,
+    stopHz: 510e6,
+    rbwHz: 200_000,
+    pointCount: 400,
+  });
+
+  const { body } = await configure({
+    startHz: 470e6,
+    stopHz: 510e6,
+    rbwHz: null, // hand RBW back to the tracking mode
+    pointCount: 2_000,
+  });
+
+  assert.ok(
+    body.pointCount > 1_900,
+    `2000 points under a leftover 200 kHz filter came back as ${body.pointCount}`
+  );
+});
+
 test('a control the instrument will not take comes back as what it kept', async () => {
   // The failure this guards against is silent: a setting draws no reply, so
   // firmware that does not implement an option ignores the line and the host

@@ -63,6 +63,26 @@ const ENUMS = {
   preamp: ['AUTO', 'OFF', 'LOW', 'MEDIUM', 'HIGH'],
 };
 
+/**
+ * The most trace points the instrument will hand out at the resolution
+ * bandwidth currently in force.
+ *
+ * Measured on a PXN-45: a 40 MHz span at RBW 200 kHz settles on 601 points,
+ * 66.6 kHz apart — one third of the RBW. Points closer together than that
+ * would be three looks through the same filter, so it declines to produce
+ * them, whatever is asked for.
+ *
+ * Reproduced here because it is what makes the order of SWE:POIN and
+ * BAND:RES matter, and an adapter that gets that order wrong looks perfectly
+ * healthy against a fake that hands out whatever it is asked for.
+ */
+const POINTS_PER_RBW = 3;
+const pointCeiling = (state) =>
+  Math.max(
+    2,
+    Math.floor((POINTS_PER_RBW * (state.stopHz - state.startHz)) / state.rbwHz)
+  );
+
 /** `NUTTall` -> `NUTT`: the leading run of capitals and digits. */
 const shortForm = (word) => word.match(/^[A-Z0-9]*/)[0];
 
@@ -177,8 +197,14 @@ function handle(line, state) {
       return String(state.stopHz);
 
     case 'SWE:POIN':
-      // the real instrument settles on something near what it was asked for
-      state.points = clamp(Math.round(Number(argument)), 2, MAX_POINTS) | 1;
+      // the real instrument settles on something near what it was asked for,
+      // and will not go finer than the filter in force can tell apart
+      state.points =
+        clamp(
+          Math.round(Number(argument)),
+          2,
+          Math.min(MAX_POINTS, pointCeiling(state))
+        ) | 1;
       return null;
     case 'SWE:POIN?':
       return String(state.points);
