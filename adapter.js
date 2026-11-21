@@ -64,6 +64,11 @@ const CHOICE_COMMANDS = {
   sweepDwell: 'SWE:TIME:AUTO',
   fftWindow: 'SWE:FFT:WIND:TYPE',
   spurRejection: 'DISP:WIND:TRAC:SPUR:SUPP',
+  // Numbered rather than worded, and documented in the guide's IQ section
+  // (§6.3.15) though the instrument offers it in standard sweep too. If some
+  // firmware declines it in this mode the read-back puts the control straight
+  // back where it was, which is the whole reason that mechanism exists.
+  loOptimize: 'LO:STAT',
 };
 
 // The instrument's own limits, from the PXN product manual.
@@ -326,11 +331,28 @@ class HarogicAnalyzerAdapter {
         choices: [
           { id: 'auto', label: 'Auto' },
           { id: '0', label: '0 dB' },
+          { id: '3', label: '3 dB' },
+          { id: '6', label: '6 dB' },
           { id: '10', label: '10 dB' },
+          { id: '15', label: '15 dB' },
           { id: '20', label: '20 dB' },
+          { id: '25', label: '25 dB' },
           { id: '30', label: '30 dB' },
         ],
-        help: 'Raise this if a strong local transmitter is compressing the front end. Auto follows the reference level.',
+        help: 'A brake on the input, so a strong local transmitter cannot compress the front end. Auto follows the reference level and is the right default — a PXN-45 left on auto picks values like 3 dB that a coarser list could not offer. Set it by hand only to hold one value steady across a measurement.',
+      },
+      {
+        id: 'loOptimize',
+        type: 'dropdown',
+        label: 'LO optimization',
+        default: '0',
+        choices: [
+          { id: '0', label: 'Auto' },
+          { id: '1', label: 'Sweep speed' },
+          { id: '2', label: 'Low spurious' },
+          { id: '3', label: 'Low phase noise' },
+        ],
+        help: '**Low spurious** is the one worth knowing about: it tunes the local oscillator to generate less of the analyzer\'s own rubbish, so you are less likely to go hunting an interferer that only exists inside the instrument. It costs some sweep speed.',
       },
       {
         id: 'detector',

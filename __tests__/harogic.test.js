@@ -102,6 +102,7 @@ test('open() measures the unit tuning range instead of trusting *IDN?', async ()
       'fftWindow',
       'spurRejection',
       'attenDb',
+      'loOptimize',
       'detector',
       'preamp',
     ]
@@ -302,6 +303,20 @@ test('a control the instrument will not take comes back as what it kept', async 
     'LOWS',
     'the host should be told what the instrument kept, not what was asked'
   );
+});
+
+test('LO optimization is applied and echoed, and a finer attenuation sticks', async () => {
+  // LO:STAT takes a number where every other enum takes a word, so it is the
+  // one that would break a matcher written only for words.
+  const lo = await configure({ ...UHF, controls: { loOptimize: '2' } });
+  assert.equal(lo.body.controls.loOptimize, '2');
+  assert.equal(instrument.state.loOptimize, '2');
+
+  // 3 dB is the value a PXN-45 picks for itself on auto, and the one the old
+  // four-entry list could not express.
+  const att = await configure({ ...UHF, controls: { attenDb: '3' } });
+  assert.equal(att.body.controls.attenDb, '3');
+  assert.equal(instrument.state.attenDb, 3);
 });
 
 test('the dwell multiplier is not confused with the plain multiplier', async () => {

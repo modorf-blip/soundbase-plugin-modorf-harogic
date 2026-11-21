@@ -120,6 +120,7 @@ export async function startFakeHarogic({ port = 0 } = {}) {
     attenDb: -1,
     detector: 'POSitive',
     preamp: 'AUTO',
+    loOptimize: '0',
     dwell: 'SWT',
     fftWindow: 'NUTTall',
     spurRejection: 'ON',
@@ -285,6 +286,15 @@ function handle(line, state) {
       return null;
     case 'DET?':
       return `"${state.detector}"`;
+
+    case 'LO:STAT':
+      // numbered, not worded: 0 auto, 1 speed, 2 spurious, 3 phase noise
+      state.loOptimize = /^[0-3]$/.test(String(argument).trim())
+        ? String(argument).trim()
+        : state.loOptimize;
+      return null;
+    case 'LO:STAT?':
+      return state.loOptimize;
 
     case 'INP:GAIN:STAT':
       state.preamp = resolveEnum('preamp', argument) ?? state.preamp;

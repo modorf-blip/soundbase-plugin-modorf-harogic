@@ -17,7 +17,7 @@ PXN-45, a PXN-90 and a rack NX without an edit.
 | Span | the unit's full range, measured at connect |
 | RBW / VBW | continuous, 0.1 Hz – 10 MHz, with automatic modes that track the span |
 | Reference level | −70 to +23 dBm |
-| Controls | reference level, RBW mode, VBW mode, dwell per sweep, FFT window, spur rejection, input attenuation, detector, preamplifier |
+| Controls | reference level, RBW mode, VBW mode, dwell per sweep, FFT window, spur rejection, LO optimization, input attenuation, detector, preamplifier |
 | Point count | sized from the span when left on auto, clamped to 16384 |
 | Trace modes | Clear/Write on the instrument — SoundBase accumulates max-hold and averaging itself, at the full sweep rate |
 
@@ -54,6 +54,30 @@ finer spacing buys sweep time and no information. Never fewer than 2000
 points, never more than 16384.
 
 Type a number and yours is used instead.
+
+### Two controls that sound alike and are not
+
+**Spur rejection** works on the measurement after it is taken: the instrument
+recognises its own spurious responses in the data and suppresses them in the
+trace.
+
+**LO optimization** works before it is taken: it moves where the local
+oscillator sits so fewer spurious products are produced in the first place.
+
+One cleans up, the other avoids making the mess. They are worth having
+together, and neither replaces the other.
+
+### Defaults
+
+Every control arrives at the value the instrument itself boots with, or the
+one its own manual recommends — not at one tuned for any particular kind of
+work. A coordinator will likely want *Low side lobe* for the FFT window, for
+instance, but that is a choice for whoever is holding the analyzer, not
+something this plugin should decide on their behalf.
+
+In practice three controls get touched in a working session — reference
+level, the RBW mode, and the dwell. The rest are there for the day they are
+needed rather than to be managed.
 
 ### What it does not do
 
