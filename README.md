@@ -17,7 +17,7 @@ PXN-45, a PXN-90 and a rack NX without an edit.
 | Span | the unit's full range, measured at connect |
 | RBW / VBW | continuous, 0.1 Hz – 10 MHz, with automatic modes that track the span |
 | Reference level | −70 to +23 dBm |
-| Controls | reference level, RBW mode, VBW mode, dwell per sweep, FFT window, spur rejection, LO optimization, input attenuation, detector, preamplifier |
+| Controls | reference level, RBW mode, VBW mode, dwell per sweep, FFT window, spur rejection, input attenuation, detector, preamplifier |
 | Point count | sized from the span when left on auto, and never more than three per RBW — see below |
 | Trace modes | Clear/Write on the instrument — SoundBase accumulates max-hold and averaging itself, at the full sweep rate |
 
@@ -81,17 +81,26 @@ does not reach the instrument. The fake analyzer reproduces the failure, so a
 regression here fails the test suite loudly rather than waiting to be found
 on a show day.
 
-### Two controls that sound alike and are not
+### One control that is missing, and why
 
-**Spur rejection** works on the measurement after it is taken: the instrument
-recognises its own spurious responses in the data and suppresses them in the
-trace.
+**LO optimization** (`LO:STAT`) moves where the local oscillator sits so that
+fewer spurious products are generated — a genuinely useful companion to spur
+rejection, which cleans them out of the trace afterwards. The instrument
+offers it on its own front panel in sweep mode. This plugin does not.
 
-**LO optimization** works before it is taken: it moves where the local
-oscillator sits so fewer spurious products are produced in the first place.
+A PXN-45 accepts `LO:STAT 0` and then never answers `LO:STAT?`.
 
-One cleans up, the other avoids making the mess. They are worth having
-together, and neither replaces the other.
+That is worse than it sounds. A reply on this protocol carries no indication
+of what it answers, so replies are matched to queries in the order they were
+asked. One query that is never answered shifts every reply after it by one
+place, for the life of the connection: the trace meant for the sweep is handed
+to a config read, the sweep waits for a reply it will never recognise, and
+nothing reports an error because every query did receive *a* reply. The socket
+stays open and healthy-looking while no measurement ever arrives.
+
+This was shipped in 0.3.3, found on hardware, and taken out again in 0.3.5.
+Until the driver can survive a dropped reply, a control belongs here only if
+the instrument answers its query. Set LO optimization on the analyzer itself.
 
 ### Defaults
 

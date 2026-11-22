@@ -303,13 +303,17 @@ function handle(line, state) {
       return `"${state.detector}"`;
 
     case 'LO:STAT':
-      // numbered, not worded: 0 auto, 1 speed, 2 spurious, 3 phase noise
+      // Accepted, and then never reported back. A PXN-45 takes the setting
+      // and does not answer LO:STAT? in sweep mode, which is why the adapter
+      // does not offer this control: an unanswered query shifts every later
+      // reply by one place. Modelled here so that anyone re-adding a
+      // read-back for it hangs in the tests rather than on a show day.
       state.loOptimize = /^[0-3]$/.test(String(argument).trim())
         ? String(argument).trim()
         : state.loOptimize;
       return null;
     case 'LO:STAT?':
-      return state.loOptimize;
+      return null; // deliberately silent — see above
 
     case 'INP:GAIN:STAT':
       state.preamp = resolveEnum('preamp', argument) ?? state.preamp;

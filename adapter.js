@@ -85,12 +85,26 @@ const CHOICE_COMMANDS = {
   sweepDwell: 'SWE:TIME:AUTO',
   fftWindow: 'SWE:FFT:WIND:TYPE',
   spurRejection: 'DISP:WIND:TRAC:SPUR:SUPP',
-  // Numbered rather than worded, and documented in the guide's IQ section
-  // (§6.3.15) though the instrument offers it in standard sweep too. If some
-  // firmware declines it in this mode the read-back puts the control straight
-  // back where it was, which is the whole reason that mechanism exists.
-  loOptimize: 'LO:STAT',
 };
+
+// Not here, and deliberately: LO optimization (LO:STAT).
+//
+// A PXN-45 accepts `LO:STAT 0` and then never answers `LO:STAT?`. The command
+// is documented in the guide's IQ section (§6.3.15); the instrument offers
+// the control in standard sweep on its own front panel, but does not answer
+// the query in that mode.
+//
+// A query that is never answered is not a small problem on this protocol. A
+// reply carries no indication of what it answers, so replies are matched to
+// queries in the order they were asked. One unanswered query shifts every
+// reply after it by one place, permanently: the trace meant for the sweep is
+// handed to the config read, the sweep waits for a reply it will never
+// recognise, and nothing reports an error because every query did get *a*
+// reply. Observed on 2026-11-22: sweeps stopped arriving and the host showed
+// the device as stalled while the socket stayed open and healthy.
+//
+// Until the driver can survive a dropped reply — it cannot today — a control
+// is only safe here if the instrument answers its query. This one does not.
 
 // The instrument's own limits, from the PXN product manual.
 const MIN_BW_HZ = 0.1;
@@ -361,19 +375,6 @@ class HarogicAnalyzerAdapter {
           { id: '30', label: '30 dB' },
         ],
         help: 'A brake on the input, so a strong local transmitter cannot compress the front end. Auto follows the reference level and is the right default — a PXN-45 left on auto picks values like 3 dB that a coarser list could not offer. Set it by hand only to hold one value steady across a measurement.',
-      },
-      {
-        id: 'loOptimize',
-        type: 'dropdown',
-        label: 'LO optimization',
-        default: '0',
-        choices: [
-          { id: '0', label: 'Auto' },
-          { id: '1', label: 'Sweep speed' },
-          { id: '2', label: 'Low spurious' },
-          { id: '3', label: 'Low phase noise' },
-        ],
-        help: '**Low spurious** is the one worth knowing about: it tunes the local oscillator to generate less of the analyzer\'s own rubbish, so you are less likely to go hunting an interferer that only exists inside the instrument. It costs some sweep speed.',
       },
       {
         id: 'detector',
